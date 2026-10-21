@@ -1,0 +1,3465 @@
+diff --git a/common/params_keys.h b/common/params_keys.h
+index eb32e71..dcea9f5 100644
+--- a/common/params_keys.h
++++ b/common/params_keys.h
+@@ -813,4 +813,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
+     {"WheelIcon", {PERSISTENT, STRING, "stock", "stock", 0}},
+     {"WheelSpeed", {PERSISTENT, BOOL, "0", "0", 2, SETTINGS_SIMPLE}},
+     {"WheelToDownload", {CLEAR_ON_MANAGER_START, STRING, "", ""}},
++    {"TorqueInterceptorEnabled", {PERSISTENT, BOOL, "1", "1"}},
++    {"RadarInterceptorEnabled", {PERSISTENT, BOOL}},
++    {"NoMRCC", {PERSISTENT, BOOL}},
++    {"NoFSC", {PERSISTENT, BOOL}},
++    {"BlendedACC", {PERSISTENT, BOOL, "1", "1"}},
++    {"ManualTransmission", {PERSISTENT, BOOL}},
+ };
+diff --git a/opendbc_repo/opendbc/can/dbc.py b/opendbc_repo/opendbc/can/dbc.py
+index b5e5bf0..030ea85 100644
+--- a/opendbc_repo/opendbc/can/dbc.py
++++ b/opendbc_repo/opendbc/can/dbc.py
+@@ -17,6 +17,7 @@ from opendbc.car.volkswagen.mqbcan import volkswagen_meb_alt_crc_checksum, volks
+ from opendbc.car.tesla.teslacan import tesla_checksum
+ from opendbc.car.body.bodycan import body_checksum
+ from opendbc.car.psa.psacan import psa_checksum
++from opendbc.car.mazda.mazdacan import mazda2017_checksum, mazda2019_checksum
+ 
+ 
+ class SignalType:
+@@ -35,6 +36,8 @@ class SignalType:
+   PSA_CHECKSUM = 12
+   VOLKSWAGEN_MLB_CHECKSUM = 13
+   PEDAL_CHECKSUM = 14
++  MAZDA2017_CHECKSUM = 15
++  MAZDA2019_CHECKSUM = 16
+ 
+ 
+ @dataclass
+@@ -216,6 +219,10 @@ def get_checksum_state(dbc_name: str) -> ChecksumState | None:
+     return ChecksumState(8, -1, 0, -1, True, SignalType.TESLA_CHECKSUM, tesla_checksum, tesla_setup_signal)
+   elif dbc_name.startswith("psa_"):
+     return ChecksumState(4, 4, 7, 3, False, SignalType.PSA_CHECKSUM, psa_checksum)
++  elif dbc_name.startswith(("mazda_2019", "mazda_2023")):
++    return ChecksumState(8, 8, 0, 0, True, SignalType.MAZDA2019_CHECKSUM, mazda2019_checksum)
++  elif dbc_name.startswith("mazda_2017"):
++    return ChecksumState(8, -1, 0, -1, True, SignalType.MAZDA2017_CHECKSUM, mazda2017_checksum)
+   return None
+ 
+ 
+diff --git a/opendbc_repo/opendbc/car/fingerprints.py b/opendbc_repo/opendbc/car/fingerprints.py
+index 1493cea..763296b 100644
+--- a/opendbc_repo/opendbc/car/fingerprints.py
++++ b/opendbc_repo/opendbc/car/fingerprints.py
+@@ -270,6 +270,7 @@ MIGRATION = {
+   "GENESIS GV80 2023": HYUNDAI.GENESIS_GV80,
+   "GENESIS GV80 2025": HYUNDAI.GENESIS_GV80_2025,
+   "MAZDA CX-5": MAZDA.MAZDA_CX5,
++  "MAZDA CX-8": MAZDA.MAZDA_CX8,
+   "MAZDA CX-9": MAZDA.MAZDA_CX9,
+   "MAZDA 3": MAZDA.MAZDA_3,
+   "MAZDA 6": MAZDA.MAZDA_6,
+diff --git a/opendbc_repo/opendbc/car/mazda/carcontroller.py b/opendbc_repo/opendbc/car/mazda/carcontroller.py
+index 6e2b1e4..26a3ddc 100644
+--- a/opendbc_repo/opendbc/car/mazda/carcontroller.py
++++ b/opendbc_repo/opendbc/car/mazda/carcontroller.py
+@@ -3,63 +3,161 @@ from opendbc.car import Bus, structs
+ from opendbc.car.lateral import apply_driver_steer_torque_limits
+ from opendbc.car.interfaces import CarControllerBase
+ from opendbc.car.mazda import mazdacan
+-from opendbc.car.mazda.values import CarControllerParams, Buttons
++from opendbc.car.mazda.values import CarControllerParams, Buttons, MazdaSafetyFlags
++from openpilot.common.realtime import DT_CTRL
++from openpilot.common.filter_simple import FirstOrderFilter
++from openpilot.common.params import Params
+ 
+ VisualAlert = structs.CarControl.HUDControl.VisualAlert
+-
++LongCtrlState = structs.CarControl.Actuators.LongControlState
+ 
+ class CarController(CarControllerBase):
+   def __init__(self, dbc_names, CP):
+     super().__init__(dbc_names, CP)
+     self.apply_torque_last = 0
++    self.ti_apply_torque_last = 0
+     self.packer = CANPacker(dbc_names[Bus.pt])
+     self.brake_counter = 0
++    self.ccp = CarControllerParams(CP)
++    self.hold_timer_frame = 0
++    self.hold_delay_frame = 0
++    self.resume_timer_frame = 0
++    self.acc_filter = FirstOrderFilter(0.0, .1, DT_CTRL, initialized=False)
++    self.filtered_acc_last = 0
++    self.long_active_last = False
++    self.params = Params()
++    self.params_memory = Params(memory=True)
++
++
+ 
+   def update(self, CC, CS, now_nanos, starpilot_toggles):
+     can_sends = []
+ 
+     apply_torque = 0
++    ti_apply_torque = 0
+ 
+     if CC.latActive:
+       # calculate steer and also set limits due to driver torque
+-      new_torque = int(round(CC.actuators.torque * CarControllerParams.STEER_MAX))
++      new_torque = int(round(CC.actuators.torque * self.ccp.STEER_MAX))
+       apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last,
+-                                                      CS.out.steeringTorque, CarControllerParams)
+-
+-    if CC.cruiseControl.cancel:
+-      # If brake is pressed, let us wait >70ms before trying to disable crz to avoid
+-      # a race condition with the stock system, where the second cancel from openpilot
+-      # will disable the crz 'main on'. crz ctrl msg runs at 50hz. 70ms allows us to
+-      # read 3 messages and most likely sync state before we attempt cancel.
+-      self.brake_counter = self.brake_counter + 1
+-      if self.frame % 10 == 0 and not (CS.out.brakePressed and self.brake_counter < 7):
+-        # Cancel Stock ACC if it's enabled while OP is disengaged
+-        # Send at a rate of 10hz until we sync with stock ACC state
+-        can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.CANCEL))
+-    else:
+-      self.brake_counter = 0
+-      if CC.cruiseControl.resume and self.frame % 5 == 0:
+-        # Mazda Stop and Go requires a RES button (or gas) press if the car stops more than 3 seconds
+-        # Send Resume button when planner wants car to move
+-        can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
++                                                      CS.out.steeringTorque, self.ccp)
++      if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
++        if CS.ti_lkas_allowed:
++          ti_new_torque = int(round(CC.actuators.torque * self.ccp.STEER_MAX))
++          ti_apply_torque = apply_driver_steer_torque_limits(ti_new_torque, self.apply_torque_last,
++                                                    CS.out.steeringTorque, self.ccp)
+ 
+     self.apply_torque_last = apply_torque
++    self.ti_apply_torque_last = ti_apply_torque
++
++    if self.CP.flags & MazdaSafetyFlags.GEN1:
++      if CC.cruiseControl.cancel:
++        # If brake is pressed, let us wait >70ms before trying to disable crz to avoid
++        # a race condition with the stock system, where the second cancel from openpilot
++        # will disable the crz 'main on'. crz ctrl msg runs at 50hz. 70ms allows us to
++        # read 3 messages and most likely sync state before we attempt cancel.
++        self.brake_counter = self.brake_counter + 1
++        if self.frame % 10 == 0 and not (CS.out.brakePressed and self.brake_counter < 7):
++          # Cancel Stock ACC if it's enabled while OP is disengaged
++          # Send at a rate of 10hz until we sync with stock ACC state
++          can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.CANCEL))
++      else:
++        self.brake_counter = 0
++        if CC.cruiseControl.resume and self.frame % 5 == 0:
++          # Mazda Stop and Go requires a RES button (or gas) press if the car stops more than 3 seconds
++          # Send Resume button when planner wants car to move
++          can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
++
++      # send HUD alerts
++      if self.frame % 50 == 0:
++        ldw = CC.hudControl.visualAlert == VisualAlert.ldw
++        steer_required = CC.hudControl.visualAlert == VisualAlert.steerRequired
++        # TODO: find a way to silence audible warnings so we can add more hud alerts
++        steer_required = steer_required and CS.lkas_allowed_speed
++        can_sends.append(mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, ldw, steer_required))
++
++      if self.CP.openpilotLongitudinalControl:
++        hold = False
++        if CS.out.standstill:
++          hold = (self.frame - self.hold_timer_frame) < 600
++        else:
++          self.hold_timer_frame = self.frame
++
++          stock_acc = CS.crz_info["ACCEL_CMD"]
++          op_acc = CC.actuators.accel * 1150
++          op_acc = max(-1000, min(op_acc, 1000))
++
++          if self.params.get_bool("BlendedACC"):
++            if CC.longActive:
++              if not self.long_active_last:
++                self.acc_filter.initialized = False
++              target_acc = op_acc if self.params_memory.get_int("CEStatus") != 0 else stock_acc
++              acc_output = self.acc_filter.update(target_acc)
++            else:
++              acc_output = stock_acc
++          else:
++            acc_output = op_acc
++
++          acc_output = max(-1000, min(acc_output, 1000))
++          CS.crz_info["ACCEL_CMD"] = acc_output
++
++        if self.frame % 2 == 0:
++          can_sends.extend(mazdacan.create_radar_command(self.packer, self.frame, CC.longActive, CS, hold))
++
++    elif self.CP.flags & MazdaSafetyFlags.GEN2:
++      if self.CP.openpilotLongitudinalControl:
++        stock_acc = CS.acc["ACCEL_CMD"]
++        op_acc = (CC.actuators.accel * 200) + 2000
++
++        if self.params.get_bool("BlendedACC"):
++          if CC.longActive:
++            if not self.long_active_last:
++              self.acc_filter.initialized = False
++            target_acc = op_acc if self.params_memory.get_int("CEStatus") != 0 else stock_acc
++            acc_output = self.acc_filter.update(target_acc)
++          else:
++            acc_output = stock_acc
++        else:
++          acc_output = op_acc if CC.longActive else stock_acc
++
++        CS.acc["ACCEL_CMD"] = acc_output
++
++      resume = False
++      hold = False
++      if self.frame % 2 == 0: # send ACC command at 50hz
++        """
++        Without this hold/resum logic, the car will only stop momentarily.
++        It will then start creeping forward again. This logic allows the car to
++        apply the electric brake to hold the car. The hold delay also fixes a
++        bug with the stock ACC where it sometimes will apply the brakes too early
++        when coming to a stop.
++        """
++        if CS.out.standstill: # if we're stopped
++          if not ((self.frame - self.hold_delay_frame) < 50): # and we have been stopped for more than hold_delay duration. This prevents a hard brake if we aren't fully stopped.
++            if ((CC.cruiseControl.resume and CC.actuators.longControlState != LongCtrlState.stopping) or
++                CC.cruiseControl.override or CS.out.gasPressed or
++                (CC.actuators.longControlState == LongCtrlState.starting) or CS.acc["RESUME"]): # if we are resuming or overriding, we want to release the brake
++              self.resume_timer_frame = self.frame # reset the resume timer so its active
++            else: # otherwise we're holding
++              hold = (self.frame - self.hold_timer_frame) < 600 # hold for 6s. This allows the electric brake to hold the car.
++
++        else: # if we're moving
++          self.hold_timer_frame = self.frame # reset the hold timer so its active when we stop
++          self.hold_delay_frame = self.frame # reset the hold delay
++
++        resume = (self.frame - self.resume_timer_frame) < 50 # stay on for 0.5s to release the brake. This allows the car to move.
++        can_sends.append(mazdacan.create_acc_cmd(self.packer, CS.acc, hold, resume))
+ 
+-    # send HUD alerts
+-    if self.frame % 50 == 0:
+-      ldw = CC.hudControl.visualAlert == VisualAlert.ldw
+-      steer_required = CC.hudControl.visualAlert == VisualAlert.steerRequired
+-      # TODO: find a way to silence audible warnings so we can add more hud alerts
+-      steer_required = steer_required and CS.lkas_allowed_speed
+-      can_sends.append(mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, ldw, steer_required))
+ 
+     # send steering command
+-    can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,
+-                                                      self.frame, apply_torque, CS.cam_lkas))
++    can_sends.extend(mazdacan.create_steering_control(
++      self.packer, self.CP, self.frame, apply_torque, CS.cam_lkas,
++      ti_apply_torque if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else None))
+ 
+     new_actuators = CC.actuators.as_builder()
+-    new_actuators.torque = apply_torque / CarControllerParams.STEER_MAX
++    new_actuators.torque = apply_torque / self.ccp.STEER_MAX
+     new_actuators.torqueOutputCan = apply_torque
+ 
++    self.long_active_last = CC.longActive
+     self.frame += 1
+-    return new_actuators, can_sends
++    return new_actuators, can_sends
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/car/mazda/carstate.py b/opendbc_repo/opendbc/car/mazda/carstate.py
+index 8ddf777..21d8689 100644
+--- a/opendbc_repo/opendbc/car/mazda/carstate.py
++++ b/opendbc_repo/opendbc/car/mazda/carstate.py
+@@ -1,9 +1,10 @@
++import copy
+ from cereal import custom
+ from opendbc.can import CANDefine, CANParser
+-from opendbc.car import Bus, create_button_events, structs
++from opendbc.car import Bus, create_button_events, structs, DT_CTRL
+ from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.interfaces import CarStateBase
+-from opendbc.car.mazda.values import DBC, LKAS_LIMITS
++from opendbc.car.mazda.values import DBC, LKAS_LIMITS, MazdaSafetyFlags, TI_STATE, CarControllerParams
+ 
+ ButtonType = structs.CarState.ButtonEvent.Type
+ 
+@@ -14,16 +15,33 @@ class CarState(CarStateBase):
+ 
+     can_define = CANDefine(DBC[CP.carFingerprint][Bus.pt])
+     self.shifter_values = can_define.dv["GEAR"]["GEAR"]
++    if CP.flags & MazdaSafetyFlags.MANUAL_TRANSMISSION:
++      self.shifter_values = can_define.dv["MANUAL_GEAR"]["GEAR"]
+ 
+     self.crz_btns_counter = 0
+     self.acc_active_last = False
+     self.lkas_allowed_speed = False
++    self.cam_lkas = 0
++    self.params = CarControllerParams(CP)
+ 
+     self.distance_button = 0
+-
+-  def update(self, can_parsers, starpilot_toggles) -> structs.CarState:
++    self.ti_ramp_down = False
++    self.ti_version = 1
++    self.ti_state = TI_STATE.RUN
++    self.ti_violation = 0
++    self.ti_error = 0
++    self.ti_lkas_allowed = False
++
++    self._prev_steering_angle = 0
++
++  def update(self, can_parsers, starpilot_toggles) -> tuple[structs.CarState, custom.StarPilotCarState]:
++    if self.CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3):
++      ret = self.update_gen2(can_parsers)
++      fp_ret = custom.StarPilotCarState.new_message()
++      return ret, fp_ret
+     cp = can_parsers[Bus.pt]
+     cp_cam = can_parsers[Bus.cam]
++    cp_body = can_parsers[Bus.body]
+ 
+     ret = structs.CarState()
+ 
+@@ -50,9 +68,23 @@ class CarState(CarStateBase):
+     ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(40, cp.vl["BLINK_INFO"]["LEFT_BLINK"] == 1,
+                                                                       cp.vl["BLINK_INFO"]["RIGHT_BLINK"] == 1)
+ 
++    if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
++      ret.steeringTorque = cp_body.vl["TI_FEEDBACK"]["TI_TORQUE_SENSOR"]
++
++      self.ti_version = cp_body.vl["TI_FEEDBACK"]["VERSION_NUMBER"]
++      self.ti_state = cp_body.vl["TI_FEEDBACK"]["STATE"] # DISCOVER = 0, OFF = 1, DRIVER_OVER = 2, RUN=3
++      self.ti_violation = cp_body.vl["TI_FEEDBACK"]["VIOL"] # 0 = no violation
++      self.ti_error = cp_body.vl["TI_FEEDBACK"]["ERROR"] # 0 = no error
++      if self.ti_version > 1:
++        self.ti_ramp_down = (cp_body.vl["TI_FEEDBACK"]["RAMP_DOWN"] == 1)
++
++      ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.TI_STEER_THRESHOLD
++      self.ti_lkas_allowed = not self.ti_ramp_down and self.ti_state == TI_STATE.RUN
++    else:
++      ret.steeringTorque = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]
++      ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.STEER_THRESHOLD
++
+     ret.steeringAngleDeg = cp.vl["STEER"]["STEER_ANGLE"]
+-    ret.steeringTorque = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]
+-    ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.STEER_THRESHOLD
+ 
+     ret.steeringTorqueEps = cp.vl["STEER_TORQUE"]["STEER_TORQUE_MOTOR"]
+     ret.steeringRateDeg = cp.vl["STEER_RATE"]["STEER_ANGLE_RATE"]
+@@ -83,35 +115,50 @@ class CarState(CarStateBase):
+ 
+     # TODO: the signal used for available seems to be the adaptive cruise signal, instead of the main on
+     #       it should be used for carState.cruiseState.nonAdaptive instead
+-    ret.cruiseState.available = cp.vl["CRZ_CTRL"]["CRZ_AVAILABLE"] == 1
+-    ret.cruiseState.enabled = cp.vl["CRZ_CTRL"]["CRZ_ACTIVE"] == 1
+-    ret.cruiseState.standstill = cp.vl["PEDALS"]["STANDSTILL"] == 1
++    ret.cruiseState.standstill = ret.standstill
+     ret.cruiseState.speed = cp.vl["CRZ_EVENTS"]["CRZ_SPEED"] * CV.KPH_TO_MS
+ 
++    if self.CP.flags & MazdaSafetyFlags.RADAR_INTERCEPTOR:
++      self.crz_info = copy.copy(cp_cam.vl["CRZ_INFO"])
++      self.crz_cntr = copy.copy(cp_cam.vl["CRZ_CTRL"])
++      self.cp_cam = cp_cam
++      ret.cruiseState.enabled = cp.vl["PEDALS"]["ACC_ACTIVE"] == 1
++      ret.cruiseState.available = cp.vl["PEDALS"]["CRZ_AVAILABLE"] == 1
++    elif self.CP.flags & MazdaSafetyFlags.NO_MRCC:
++      ret.cruiseState.enabled = cp.vl["PEDALS"]["ACC_ACTIVE"] == 1
++      ret.cruiseState.available = cp.vl["PEDALS"]["CRZ_AVAILABLE"] == 1
++    else:
++      ret.cruiseState.available = cp.vl["CRZ_CTRL"]["CRZ_AVAILABLE"] == 1
++      ret.cruiseState.enabled = cp.vl["CRZ_CTRL"]["CRZ_ACTIVE"] == 1
++
+     # stock lkas should be on
+     # TODO: is this needed?
+-    ret.invalidLkasSetting = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0
+-
+-    if ret.cruiseState.enabled:
+-      if not self.lkas_allowed_speed and self.acc_active_last:
+-        self.low_speed_alert = True
+-      else:
+-        self.low_speed_alert = False
+-    ret.lowSpeedAlert = self.low_speed_alert
++    if not self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
++      if ret.cruiseState.enabled:
++        if not self.lkas_allowed_speed and self.acc_active_last:
++          self.low_speed_alert = True
++        else:
++          self.low_speed_alert = False
++      ret.lowSpeedAlert = self.low_speed_alert
+ 
+     # Check if LKAS is disabled due to lack of driver torque when all other states indicate
+     # it should be enabled (steer lockout). Don't warn until we actually get lkas active
+     # and lose it again, i.e, after initial lkas activation
+-    ret.steerFaultTemporary = self.lkas_allowed_speed and lkas_blocked
++    ret.steerFaultTemporary = self.lkas_allowed_speed and lkas_blocked and not self.ti_lkas_allowed
+ 
+     self.acc_active_last = ret.cruiseState.enabled
+ 
+     self.crz_btns_counter = cp.vl["CRZ_BTNS"]["CTR"]
+ 
+     # camera signals
+-    self.cam_lkas = cp_cam.vl["CAM_LKAS"]
+-    self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
+-    ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1
++    if not self.CP.flags & MazdaSafetyFlags.NO_FSC:
++      ret.invalidLkasSetting = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0
++      self.lkas_disabled = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0 if not self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else False
++      self.cam_lkas = cp_cam.vl["CAM_LKAS"]
++      self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
++      ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 if not self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else False
++    self.cp_cam = cp_cam
++    self.cp = cp
+ 
+     # TODO: add button types for inc and dec
+     ret.buttonEvents = create_button_events(self.distance_button, prev_distance_button, {1: ButtonType.gapAdjustCruise})
+@@ -122,9 +169,68 @@ class CarState(CarStateBase):
+ 
+     return ret, fp_ret
+ 
++  def update_gen2(self, can_parsers) -> structs.CarState:
++    cp = can_parsers[Bus.pt]
++    cp_cam = can_parsers[Bus.cam]
++    cp_body = can_parsers[Bus.body]
++    ret = structs.CarState()
++
++    self.parse_wheel_speeds(ret,
++        cp_cam.vl["WHEEL_SPEEDS"]["FL"],
++        cp_cam.vl["WHEEL_SPEEDS"]["FR"],
++        cp_cam.vl["WHEEL_SPEEDS"]["RL"],
++        cp_cam.vl["WHEEL_SPEEDS"]["RR"],
++    )
++
++    ret.steeringTorque = cp_body.vl["TI_FEEDBACK"]["STEER_TORQUE_SENSOR"]
++    ret.steeringPressed = abs(ret.steeringTorque) > self.params.STEER_DRIVER_ALLOWANCE
++
++    if self.CP.flags & MazdaSafetyFlags.MANUAL_TRANSMISSION:
++      can_gear = int(cp_cam.vl["MANUAL_GEAR"]["GEAR"])
++    else:
++      can_gear = int(cp_cam.vl["GEAR"]["GEAR"])
++
++    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(100, cp.vl["BLINK_INFO"]["LEFT_BLINK"] == 1,
++                                                                      cp.vl["BLINK_INFO"]["RIGHT_BLINK"] == 1)
++
++    ret.gearShifter = self.parse_gear_shifter(self.shifter_values.get(can_gear, None))
++    ret.gasPressed = cp_cam.vl["ENGINE_DATA"]["PEDAL_GAS"] > 0
++    ret.seatbeltUnlatched = False # Cruise will not engage if seatbelt is unlatched (handled by car)
++    ret.doorOpen = False # Cruise will not engage if door is open (handled by car)
++    ret.brakePressed = cp.vl["BRAKE_PEDAL"]["BRAKE_PRESSED"] == 1
++    ret.brake = .1
++    ret.steerFaultPermanent = False # TODO locate signal. Car shows light on dash if there is a fault
++    ret.steerFaultTemporary = False # TODO locate signal. Car shows light on dash if there is a fault
++
++    unit_conversion = CV.MPH_TO_MS if cp.vl["SYSTEM_SETTINGS"]["IMPERIAL_UNIT"] else CV.KPH_TO_MS
++    ret.standstill = cp_cam.vl["SPEED"]["SPEED"] * unit_conversion < 0.1
++    if self.CP.flags & MazdaSafetyFlags.GEN2:
++      ret.cruiseState.speed = cp.vl["CRUZE_STATE"]["CRZ_SPEED"] * unit_conversion
++      ret.cruiseState.enabled = (cp.vl["CRUZE_STATE"]["CRZ_STATE"] >= 2)
++      ret.cruiseState.available = (cp.vl["CRUZE_STATE"]["CRZ_STATE"] != 0)
++    else:
++      ret.cruiseState.speed = cp_body.vl["CRUZE_STATE"]["CRZ_SPEED"] * unit_conversion
++      ret.cruiseState.enabled = (cp_body.vl["CRUZE_STATE"]["CRZ_STATE"] >= 3)
++      ret.cruiseState.available = (cp_body.vl["CRUZE_STATE"]["CRZ_STATE"] >= 2)
++    ret.steeringAngleDeg = cp.vl["STEER"]["STEER_ANGLE"]
++    ret.steeringRateDeg = (ret.steeringAngleDeg - self._prev_steering_angle) / DT_CTRL
++    self._prev_steering_angle = ret.steeringAngleDeg
++    ret.cruiseState.standstill = ret.standstill if not self.CP.openpilotLongitudinalControl else False
++
++    self.cp = cp
++    self.cp_cam = cp_cam
++    self.acc = copy.copy(cp.vl["ACC"])
++
++    return ret
++
+   @staticmethod
+   def get_can_parsers(CP):
++    cam_signals = []
++    if not (CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3)):
++      cam_signals.append(("CAM_TRAFFIC_SIGNS", 0))
++
+     return {
+       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
+-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [("CAM_TRAFFIC_SIGNS", 0)], 2),
++      Bus.body: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1),
++      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_signals, 2),
+     }
+diff --git a/opendbc_repo/opendbc/car/mazda/fingerprints.py b/opendbc_repo/opendbc/car/mazda/fingerprints.py
+index 5569e28..4d8f5ba 100644
+--- a/opendbc_repo/opendbc/car/mazda/fingerprints.py
++++ b/opendbc_repo/opendbc/car/mazda/fingerprints.py
+@@ -129,6 +129,26 @@ FW_VERSIONS = {
+       b'SH9T-21PS1-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+     ],
+   },
++  CAR.MAZDA_CX8: {
++    (Ecu.eps, 0x730, None): [
++      b'K19G-3210X-A-00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.engine, 0x7e0, None): [
++      b'PYW2-188K2-A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.fwdRadar, 0x764, None): [
++      b'K131-67XK2-F\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.abs, 0x760, None): [
++      b'K632-437K2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.fwdCamera, 0x706, None): [
++      b'GSH7-67XK2-T\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.transmission, 0x7e1, None): [
++      b'PYV8-21PS1-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++  },
+   CAR.MAZDA_CX9: {
+     (Ecu.eps, 0x730, None): [
+       b'K070-3210X-C-00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+@@ -280,4 +300,108 @@ FW_VERSIONS = {
+       b'PXM7-21PS1-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+     ],
+   },
++  CAR.MAZDA_3_2019: {
++    (Ecu.eps, 0x730, None): [
++      b'BDGF-3216X-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BCKA-3216X-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BCKA-3216X-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      #b'BDGF-3216X-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BCKA-3216X-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.engine, 0x7e0, None): [
++      b'PX4L-188K2-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PA2J-188K2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      #b'PX06-188K2-S\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX06-188K2-N\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX08-188K2-L\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX4W-188K2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.fwdRadar, 0x764, None): [
++      b'BDTS-67XK2-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      #b'B0N2-67XK2-A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'B0N2-67XK2-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.abs, 0x760, None): [
++      b'BFVV-4300F-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BHCB-4300F-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BCKA-4300F-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BCKA-4300F-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BFVV-4300F-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.fwdCamera, 0x706, None): [
++      b'DFR5-67WK2-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BDGF-67WK2-K\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BDGF-67WK2-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      #b'BDGF-67WK2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'DFR5-67WK2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.transmission, 0x7e1, None): [
++      b'PX4L-21PS1-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PAM6-21PS1-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      #b'PX01-21PS1-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX03-21PS1-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX4K-21PS1-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++  },
++  CAR.MAZDA_CX_30: {
++    (Ecu.eps, 0x730, None): [
++      b'DFR5-3216X-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BDGF-3216X-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.engine, 0x7e0, None): [
++      b'PX06-188K2-S\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX4N-188K2-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PXKJ-188K2-A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.fwdRadar, 0x764, None): [
++      b'BDTS-67XK2-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'B0N2-67XK2-A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.abs, 0x760, None): [
++      b'DEJW-4300F-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BCKA-4300F-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'DHPC-4300F-A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.fwdCamera, 0x706, None): [
++      b'BDGF-67WK2-K\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'BDGF-67WK2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.transmission, 0x7e1, None): [
++      b'PX01-21PS1-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX4N-21PS1-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX6G-21PS1-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++  },
++
++  CAR.MAZDA_CX_50: {
++    (Ecu.eps, 0x730, None): [
++      b'VA40-3216Y-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.engine, 0x7e0, None): [
++      b'PX06-188K2-N\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX08-188K2-L\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX4W-188K2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.fwdRadar, 0x764, None): [
++      b'VA45-67XK2-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.abs, 0x760, None): [
++      b'VA40-4300F-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'VA40-4300F-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.fwdCamera, 0x706, None): [
++      b'VA40-67WK2-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++    (Ecu.transmission, 0x7e1, None): [
++      #b'PX01-21PS1-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX03-21PS1-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'PX4K-21PS1-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++  },
++}
++
++FINGERPRINTS = {
++  CAR.MAZDA_CX_30_2023: [{
++    80: 8, 119: 8, 126: 8, 128: 8, 131: 8, 135: 8, 136: 8, 137: 8, 143: 4, 145: 8, 150: 8, 153: 8, 154: 8, 155: 8, 156: 8, 159: 8, 192: 8, 253: 8, 254: 8, 304: 8, 357: 8, 358: 8, 379: 8, 512: 8, 514: 8, 518: 8, 529: 8, 531: 8, 533: 8, 542: 8, 543: 8, 546: 8, 547: 8, 552: 8, 570: 8, 608: 8, 640: 8, 641: 8, 736: 8, 830: 8, 832: 8, 864: 8, 865: 8, 866: 8, 867: 8, 868: 8, 869: 8, 870: 8, 871: 8, 872: 8, 873: 8, 874: 8, 875: 8, 876: 8, 877: 8, 878: 8, 879: 8, 880: 8, 881: 8, 882: 8, 883: 8, 884: 8, 885: 8, 886: 8, 887: 8, 888: 8, 960: 8, 979: 8, 1010: 8, 1016: 8, 1028: 8, 1029: 8, 1030: 8, 1031: 8, 1034: 8, 1044: 8, 1045: 8, 1056: 8, 1058: 8, 1060: 8, 1066: 8, 1067: 8, 1078: 8, 1084: 8, 1086: 8, 1087: 8, 1088: 8, 1093: 8, 1100: 8, 1120: 8, 1136: 8, 1137: 8, 1138: 8, 1139: 8, 1157: 8, 1163: 8, 1167: 8, 1203: 8, 1242: 8, 1243: 8, 1244: 8, 1260: 8, 1264: 8, 1266: 8, 1267: 8, 1274: 8, 1275: 8, 1305: 8, 1306: 8, 1307: 8, 1344: 8, 1409: 8, 1430: 8, 1440: 8
++  }],
+ }
+diff --git a/opendbc_repo/opendbc/car/mazda/interface.py b/opendbc_repo/opendbc/car/mazda/interface.py
+index d2f5a49..f9f7c4f 100644
+--- a/opendbc_repo/opendbc/car/mazda/interface.py
++++ b/opendbc_repo/opendbc/car/mazda/interface.py
+@@ -1,34 +1,140 @@
+ #!/usr/bin/env python3
++from math import exp, fabs
++import numpy as np
++
+ from opendbc.car import get_safety_config, structs
+ from opendbc.car.common.conversions import Conversions as CV
+-from opendbc.car.interfaces import CarInterfaceBase
++from opendbc.car.interfaces import CarInterfaceBase, TorqueFromLateralAccelCallbackType, LateralAccelFromTorqueCallbackType
+ from opendbc.car.mazda.carcontroller import CarController
+ from opendbc.car.mazda.carstate import CarState
+-from opendbc.car.mazda.values import CAR, LKAS_LIMITS
++from opendbc.car.mazda.values import CAR, LKAS_LIMITS, MazdaSafetyFlags, MazdaSafetyFlags, GEN1, GEN2, GEN3
++from openpilot.common.params import Params
+ 
++NON_LINEAR_TORQUE_PARAMS = {
++  CAR.MAZDA_3_2019: (4.6, 0.6, 0.134, 0.3605),
++  CAR.MAZDA_CX_30: (4.68689, 0.79999, 0.18244, 0.38763),
++  CAR.MAZDA_CX_30_2023: (4.68689, 0.79999, 0.18244, 0.38763),
++  CAR.MAZDA_CX_50: (4.68689, 0.79999, 0.18244, 0.38763)
++}
+ 
+ class CarInterface(CarInterfaceBase):
+   CarState = CarState
+   CarController = CarController
+ 
++  def get_lataccel_torque_siglin(self) -> float:
++
++    def torque_from_lateral_accel_siglin_func(lateral_acceleration: float) -> float:
++      # The "lat_accel vs torque" relationship is assumed to be the sum of "sigmoid + linear" curves
++      # An important thing to consider is that the slope at 0 should be > 0 (ideally >1)
++      # This has big effect on the stability about 0 (noise when going straight)
++      non_linear_torque_params = NON_LINEAR_TORQUE_PARAMS.get(self.CP.carFingerprint)
++      assert non_linear_torque_params, "The params are not defined"
++      a, b, c, _ = non_linear_torque_params
++      sig_input = a * lateral_acceleration
++      sig = np.sign(sig_input) * (1 / (1 + exp(-fabs(sig_input))) - 0.5)
++      steer_torque = (sig * b) + (lateral_acceleration * c)
++      return float(steer_torque)
++
++    lataccel_values = np.arange(-8.0, 8.0, 0.01)
++    torque_values = [torque_from_lateral_accel_siglin_func(x) for x in lataccel_values]
++    print(torque_values)
++    assert min(torque_values) < -1 and max(torque_values) > 1, "The torque values should cover the range [-1, 1]"
++    return torque_values, lataccel_values
++
++  def torque_from_lateral_accel(self) -> TorqueFromLateralAccelCallbackType:
++    if self.CP.carFingerprint in NON_LINEAR_TORQUE_PARAMS:
++      torque_values, lataccel_values = self.get_lataccel_torque_siglin()
++
++      def torque_from_lateral_accel_siglin(lateral_acceleration: float, torque_params: structs.CarParams.LateralTorqueTuning):
++        return np.interp(lateral_acceleration, lataccel_values, torque_values)
++      return torque_from_lateral_accel_siglin
++    else:
++      return self.torque_from_lateral_accel_linear
++
++  def lateral_accel_from_torque(self) -> LateralAccelFromTorqueCallbackType:
++    if self.CP.carFingerprint in NON_LINEAR_TORQUE_PARAMS:
++      torque_values, lataccel_values = self.get_lataccel_torque_siglin()
++
++      def lateral_accel_from_torque_siglin(torque: float, torque_params: structs.CarParams.LateralTorqueTuning):
++        return np.interp(torque, torque_values, lataccel_values)
++      return lateral_accel_from_torque_siglin
++    else:
++      return self.lateral_accel_from_torque_linear
++
++
+   @staticmethod
+   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
+     ret.brand = "mazda"
+     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.mazda)]
++    p = Params()
++
+     ret.radarUnavailable = True
+ 
+-    ret.dashcamOnly = candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021)
++    ret.dashcamOnly = False
+ 
+-    ret.steerActuatorDelay = 0.1
+     ret.steerLimitTimer = 0.8
+ 
+     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
+ 
+-    if candidate not in (CAR.MAZDA_CX5_2022,):
++    if candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_3_2019, CAR.MAZDA_CX_30, CAR.MAZDA_CX_50, CAR.MAZDA_3_2023, CAR.MAZDA_CX_30_2023):
+       ret.minSteerSpeed = LKAS_LIMITS.DISABLE_SPEED * CV.KPH_TO_MS
+ 
+-    ret.centerToFront = ret.wheelbase * 0.41
+-
+     ret.enableBsm = True
+ 
++    if p.get_bool("ManualTransmission"):
++      ret.flags |= MazdaSafetyFlags.MANUAL_TRANSMISSION.value
++      ret.transmissionType = structs.CarParams.TransmissionType.manual
++    else:
++      ret.transmissionType = structs.CarParams.TransmissionType.automatic
++
++    if candidate in GEN1:
++      ret.steerActuatorDelay = 0.335
++      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.GEN1.value
++      if p.get_bool("TorqueInterceptorEnabled"): # Torque Interceptor Installed
++        ret.flags |= MazdaSafetyFlags.TORQUE_INTERCEPTOR.value
++        ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.TORQUE_INTERCEPTOR.value
++        ret.minSteerSpeed = 0.0
++        ret.steerAtStandstill = True
++      if p.get_bool("RadarInterceptorEnabled"): # Radar Interceptor Installed
++        ret.flags |= MazdaSafetyFlags.RADAR_INTERCEPTOR.value
++        ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.RADAR_INTERCEPTOR.value
++        ret.alphaLongitudinalAvailable = alpha_long
++        ret.openpilotLongitudinalControl = True
++        ret.radarUnavailable = False
++        ret.startingState = True
++        ret.longitudinalTuning.kpBP = [0., 5., 30.]
++        ret.longitudinalTuning.kpV = [1.3, 1.0, 0.7]
++        ret.longitudinalTuning.kiBP = [0., 5., 20., 30.]
++        ret.longitudinalTuning.kiV = [0.36, 0.23, 0.17, 0.1]
++      if p.get_bool("NoMRCC"): # No Mazda Radar Cruise Control; Missing CRZ_CTRL signal
++        ret.flags |= MazdaSafetyFlags.NO_MRCC.value
++        ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.NO_MRCC.value
++      if p.get_bool("NoFSC"):  # No Front Sensing Camera
++        ret.flags |= MazdaSafetyFlags.NO_FSC.value
++        ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.NO_FSC.value
++
++    if candidate in GEN2:
++      ret.steerActuatorDelay = 0.5
++      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.GEN2.value
++      ret.alphaLongitudinalAvailable = alpha_long
++      ret.openpilotLongitudinalControl = True
++      ret.stopAccel = -.5
++      ret.vEgoStarting = .2
++      ret.longitudinalActuatorDelay = 0.35 # gas is 0.25s and brake looks like 0.5
++      ret.longitudinalTuning.kpBP = [0., 5., 35.]
++      ret.longitudinalTuning.kpV = [0.0, 0.0, 0.0]
++      ret.longitudinalTuning.kiBP = [0., 35.]
++      ret.longitudinalTuning.kiV = [0.1, 0.1]
++      ret.startingState = True
++      ret.steerAtStandstill = True
++      ret.enableBsm = False
++
++    if candidate in GEN3:
++      ret.steerActuatorDelay = 0.5
++      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.GEN3.value
++      ret.alphaLongitudinalAvailable = False
++      ret.openpilotLongitudinalControl = False
++      if p.get_bool("ManualTransmission"):
++        ret.flags |= MazdaSafetyFlags.MANUAL_TRANSMISSION.value
++      ret.enableBsm = False
+     return ret
+diff --git a/opendbc_repo/opendbc/car/mazda/mazdacan.py b/opendbc_repo/opendbc/car/mazda/mazdacan.py
+index adccdd6..9c4dfba 100644
+--- a/opendbc_repo/opendbc/car/mazda/mazdacan.py
++++ b/opendbc_repo/opendbc/car/mazda/mazdacan.py
+@@ -1,66 +1,83 @@
+-from opendbc.car.mazda.values import Buttons, MazdaFlags
+-
+-
+-def create_steering_control(packer, CP, frame, apply_torque, lkas):
+-
+-  tmp = apply_torque + 2048
+-
+-  lo = tmp & 0xFF
+-  hi = tmp >> 8
+-
+-  # copy values from camera
+-  b1 = int(lkas["BIT_1"])
+-  er1 = int(lkas["ERR_BIT_1"])
+-  lnv = 0
+-  ldw = 0
+-  er2 = int(lkas["ERR_BIT_2"])
+-
+-  # Some older models do have these, newer models don't.
+-  # Either way, they all work just fine if set to zero.
+-  steering_angle = 0
+-  b2 = 0
+-
+-  tmp = steering_angle + 2048
+-  ahi = tmp >> 10
+-  amd = (tmp & 0x3FF) >> 2
+-  amd = (amd >> 4) | ((amd & 0xF) << 4)
+-  alo = (tmp & 0x3) << 2
+-
+-  ctr = frame % 16
+-  # bytes:     [    1  ] [ 2 ] [             3               ]  [           4         ]
+-  csum = 249 - ctr - hi - lo - (lnv << 3) - er1 - (ldw << 7) - (er2 << 4) - (b1 << 5)
+-
+-  # bytes      [ 5 ] [ 6 ] [    7   ]
+-  csum = csum - ahi - amd - alo - b2
+-
+-  if ahi == 1:
+-    csum = csum + 15
+-
+-  if csum < 0:
+-    if csum < -256:
+-      csum = csum + 512
+-    else:
+-      csum = csum + 256
+-
+-  csum = csum % 256
+-
+-  values = {}
+-  if CP.flags & MazdaFlags.GEN1:
++from opendbc.car.mazda.values import Buttons, MazdaSafetyFlags
++from numpy import clip
++
++def create_steering_control(packer, CP, frame, apply_torque, lkas, ti_apply_torque = None):
++  msgs = []
++  if CP.flags & MazdaSafetyFlags.GEN1:
++    if not CP.flags & MazdaSafetyFlags.NO_FSC:
++      tmp = apply_torque + 2048
++
++      lo = tmp & 0xFF
++      hi = tmp >> 8
++
++      # copy values from camera
++      b1 = int(lkas["BIT_1"])
++      er1 = int(lkas["ERR_BIT_1"])
++      lnv = 0
++      ldw = 0
++      er2 = int(lkas["ERR_BIT_2"])
++
++      # Some older models do have these, newer models don't.
++      # Either way, they all work just fine if set to zero.
++      steering_angle = 0
++      b2 = 0
++
++      tmp = steering_angle + 2048
++      ahi = tmp >> 10
++      amd = (tmp & 0x3FF) >> 2
++      amd = (amd >> 4) | (( amd & 0xF) << 4)
++      alo = (tmp & 0x3) << 2
++
++      ctr = frame % 16
++      # bytes:     [    1  ] [ 2 ] [             3               ]  [           4         ]
++      csum = 249 - ctr - hi - lo - (lnv << 3) - er1 - (ldw << 7) - ( er2 << 4) - (b1 << 5)
++
++      # bytes      [ 5 ] [ 6 ] [    7   ]
++      csum = csum - ahi - amd - alo - b2
++
++      if ahi == 1:
++        csum = csum + 15
++
++      if csum < 0:
++        if csum < -256:
++          csum = csum + 512
++        else:
++          csum = csum + 256
++
++      csum = csum % 256
++
++      values = {
++        "LKAS_REQUEST": apply_torque,
++        "CTR": ctr,
++        "ERR_BIT_1": er1,
++        "LINE_NOT_VISIBLE" : lnv,
++        "LDW": ldw,
++        "BIT_1": b1,
++        "ERR_BIT_2": er2,
++        "STEERING_ANGLE": steering_angle,
++        "ANGLE_ENABLED": b2,
++        "CHKSUM": csum
++      }
++      msgs.append(packer.make_can_msg("CAM_LKAS", 0, values))
++
++    if ti_apply_torque is not None:
++      values = {
++          "LKAS_REQUEST"     : ti_apply_torque,
++          "CHKSUM"           : ti_apply_torque,
++          "KEY"              : 3294744160
++      }
++      msgs.append(packer.make_can_msg("CAM_LKAS2", 1, values))
++
++  elif CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3) :
++    bus = 1
++    sig_name = "EPS_LKAS"
+     values = {
+       "LKAS_REQUEST": apply_torque,
+-      "CTR": ctr,
+-      "ERR_BIT_1": er1,
+-      "LINE_NOT_VISIBLE": lnv,
+-      "LDW": ldw,
+-      "BIT_1": b1,
+-      "ERR_BIT_2": er2,
+-      "STEERING_ANGLE": steering_angle,
+-      "ANGLE_ENABLED": b2,
+-      "CHKSUM": csum
++      "STEER_FEEL": 10000,
+     }
++    msgs.append(packer.make_can_msg(sig_name, bus, values))
+ 
+-  return packer.make_can_msg("CAM_LKAS", 0, values)
+-
++  return msgs
+ 
+ def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool):
+   values = {s: cam_msg[s] for s in [
+@@ -93,7 +110,7 @@ def create_button_cmd(packer, CP, counter, button):
+   can = int(button == Buttons.CANCEL)
+   res = int(button == Buttons.RESUME)
+ 
+-  if CP.flags & MazdaFlags.GEN1:
++  if CP.flags & MazdaSafetyFlags.GEN1:
+     values = {
+       "CAN_OFF": can,
+       "CAN_OFF_INV": (can + 1) % 2,
+@@ -126,3 +143,96 @@ def create_button_cmd(packer, CP, counter, button):
+     }
+ 
+     return packer.make_can_msg("CRZ_BTNS", 0, values)
++
++STATIC_DATA_21B = [0x01FFE000, 0x00000000]
++STATIC_DATA_361 = [0xFFF7FEFE, 0x1FC]
++STATIC_DATA_362 = [0xFFF7FEFE, 0x1FC]
++STATIC_DATA_363 = [0xFFF7FEFE, 0x1FC0000]
++STATIC_DATA_364 = [0xFFF7FEFE, 0x1FC0000]
++STATIC_DATA_365 = [0xFFF7FE7F, 0xFBFF3FC]
++STATIC_DATA_366 = [0xFFF7FE7F, 0xFBFF3FC]
++static_data_list = [STATIC_DATA_361, STATIC_DATA_362, STATIC_DATA_363, STATIC_DATA_364, STATIC_DATA_365, STATIC_DATA_366]
++
++# GEN1 radar interceptor
++def create_radar_command(packer, frame, active, CS, hold):
++  #accel = 0
++  ret = []
++  crz_ctrl = CS.crz_cntr
++  crz_info = CS.crz_info
++
++  # if CC.longActive: # this is set true in longcontrol.py
++  #   accel = CC.actuators.accel * 1150
++  #   accel = accel if accel < 1000 else 1000
++  # else:
++  #   accel = int(crz_info["ACCEL_CMD"])
++
++  crz_info["ACC_ACTIVE"] = active
++  crz_info["ACC_SET_ALLOWED"] = int(bool(int(CS.cp.vl["GEAR"]["GEAR"]) & 4)) # we can set ACC_SET_ALLOWED bit when in drive. Allows crz to be set from 1kmh.
++  crz_info["CRZ_ENDED"] = 0 # this should keep acc on down to 5km/h on my 2018 M3
++  #crz_info["ACCEL_CMD"] = accel
++  crz_info["STOPPING_MAYBE"] = hold
++  crz_info["STOPPING_MAYBE2"] = hold
++
++  crz_ctrl["CRZ_ACTIVE"] = active
++  crz_ctrl["ACC_ACTIVE_2"] = active
++  crz_ctrl["DISABLE_TIMER_1"] = 0
++  crz_ctrl["DISABLE_TIMER_2"] = 0
++
++  ret.append(packer.make_can_msg("CRZ_INFO", 0, crz_info))
++  ret.append(packer.make_can_msg("CRZ_CTRL", 0, crz_ctrl))
++  # convert steering angle to radar units and clip to range
++  steer_angle = (CS.out.steeringAngleDeg *-17.4) + 2048
++
++  if (frame % 10 == 0):
++    for i, addr in enumerate(range(361,367)):
++      addr_name = f"RADAR_{addr}"
++      msg = CS.cp_cam.vl[addr_name]
++      values = {
++        "MSGS_1" : static_data_list[i][0],
++        "MSGS_2" : static_data_list[i][1],
++        "CTR"    : int(msg["CTR"]) #frame % 16
++      }
++      if addr == 361:
++        values.update({
++          "INVERSE_SPEED" : int(CS.out.vEgo * -4.4),
++          "BIT" : 1,
++        })
++      if addr == 362:
++        values.update({
++          "CLIPPED_STEER_ANGLE" : int(clip(steer_angle, 0, 4092)),
++        })
++      ret.append(packer.make_can_msg(addr_name, 0, values))
++
++  return ret
++
++# GEN2 new mazdas
++def create_acc_cmd(packer, values, hold, resume):
++  msg_name = "ACC"
++  bus = 2
++
++  if (values["ACC_ENABLED"]):
++    values["HOLD"] = hold
++    values["RESUME"] = resume
++  else:
++    pass
++
++  return packer.make_can_msg(msg_name, bus, values)
++
++def mazda2019_checksum(address: int, sig, d: bytearray) -> int:
++  checksum = 0
++  if address == 0x220:
++    checksum = 0x2a
++  if address == 0x249:
++    checksum = 0x53
++  # Simple sum over the payload, except for the byte where the checksum lives.
++  for i in range(7):
++    checksum += d[i]
++  return checksum % 256
++
++def mazda2017_checksum(address: int, sig, d: bytearray) -> int:
++  sum_val = 0
++  if d[5] & 0x5:
++    sum_val = 0xFC
++  for i in range(len(d) - 1):
++    sum_val += d[i]
++  return (~sum_val) & 0xFF
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/car/mazda/radar_interface.py b/opendbc_repo/opendbc/car/mazda/radar_interface.py
+new file mode 100644
+index 0000000..9f870c8
+--- /dev/null
++++ b/opendbc_repo/opendbc/car/mazda/radar_interface.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++import math
++
++from opendbc.can.parser import CANParser
++from opendbc.car import Bus, structs
++from opendbc.car.interfaces import RadarInterfaceBase
++from opendbc.car.mazda.values import DBC, MazdaSafetyFlags
++
++def get_radar_can_parser(CP):
++  if Bus.radar not in DBC[CP.carFingerprint]:
++    return None
++  if not CP.flags & MazdaSafetyFlags.RADAR_INTERCEPTOR:
++    return None
++
++  messages = [(f"RADAR_TRACK_{addr}", 10) for addr in range(361,367)]
++  return CANParser(DBC[CP.carFingerprint][Bus.radar], messages, 2)
++
++class RadarInterface(RadarInterfaceBase):
++  def __init__(self, CP):
++    super().__init__(CP)
++    self.updated_messages = set()
++    self.track_id = 0
++
++    self.radar_off_can = CP.radarUnavailable
++    self.rcp = get_radar_can_parser(CP)
++
++  def update(self, can_strings):
++    if self.radar_off_can or (self.rcp is None):
++      return super().update(None)
++    vls = self.rcp.update_strings(can_strings)
++    self.updated_messages.update(vls)
++    rr = self._update(self.updated_messages)
++    self.updated_messages.clear()
++
++    return rr
++
++  def _update(self, updated_messages):
++    ret = structs.RadarData()
++    if self.rcp is None:
++      return ret
++    errors = []
++    if not self.rcp.can_valid:
++      errors.append("canError")
++    ret.errors = errors
++    for addr in range(361,367):
++      msg = self.rcp.vl[f"RADAR_TRACK_{addr}"]
++      if addr not in self.pts:
++        self.pts[addr] = structs.RadarData.RadarPoint()
++        self.pts[addr].trackId = self.track_id
++        self.track_id += 1
++      valid = (msg['DIST_OBJ'] != 4095) and (msg['ANG_OBJ'] != 2046) and (msg['RELV_OBJ'] != -16)
++      if valid:
++        azimuth = math.radians(msg['ANG_OBJ']/64)
++        self.pts[addr].measured = True
++        self.pts[addr].dRel = msg['DIST_OBJ']/16
++        self.pts[addr].yRel = -math.sin(azimuth) * msg['DIST_OBJ']/16
++        self.pts[addr].vRel = msg['RELV_OBJ']/16
++        self.pts[addr].aRel = float('nan')
++        self.pts[addr].yvRel = float('nan')
++      else:
++        del self.pts[addr]
++    ret.points = list(self.pts.values())
++    return ret
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/car/mazda/values.py b/opendbc_repo/opendbc/car/mazda/values.py
+index 80c3455..bb5b98c 100644
+--- a/opendbc_repo/opendbc/car/mazda/values.py
++++ b/opendbc_repo/opendbc/car/mazda/values.py
+@@ -9,20 +9,39 @@ from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries
+ 
+ Ecu = CarParams.Ecu
+ 
+-
+-# Steer torque limits
+-
+ class CarControllerParams:
+-  STEER_MAX = 800                # theoretical max_steer 2047
+-  STEER_DELTA_UP = 10             # torque increase per refresh
+-  STEER_DELTA_DOWN = 25           # torque decrease per refresh
+-  STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
+-  STEER_DRIVER_MULTIPLIER = 1     # weight driver torque
+-  STEER_DRIVER_FACTOR = 1         # from dbc
+-  STEER_STEP = 1  # 100 Hz
+-
+   def __init__(self, CP):
+-    pass
++    self.STEER_STEP = 1 # 100 Hz
++    if CP.flags & MazdaSafetyFlags.GEN1:
++      self.STEER_MAX = 800                # theoretical max_steer 2047
++      self.STEER_DELTA_UP = 10             # torque increase per refresh
++      self.STEER_DELTA_DOWN = 25           # torque decrease per refresh
++      self.STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
++      self.STEER_DRIVER_MULTIPLIER = 40     # weight driver torque
++      self.STEER_DRIVER_FACTOR = 1         # from dbc
++      self.STEER_ERROR_MAX = 350           # max delta between torque cmd and torque motor
++
++      self.TI_STEER_MAX = 600                # theoretical max_steer 2047
++      self.TI_STEER_DELTA_UP = 6             # torque increase per refresh
++      self.TI_STEER_DELTA_DOWN = 15           # torque decrease per refresh
++      self.TI_STEER_DRIVER_ALLOWANCE = 15    # allowed driver torque before start limiting
++      self.TI_STEER_DRIVER_MULTIPLIER = 40     # weight driver torque
++      self.TI_STEER_DRIVER_FACTOR = 1         # from dbc
++      self.TI_STEER_ERROR_MAX = 350           # max delta between torque cmd and torque motor
++    if CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3):
++      self.STEER_MAX = 8000
++      self.STEER_DELTA_UP = 45              # torque increase per refresh
++      self.STEER_DELTA_DOWN = 80            # torque decrease per refresh
++      self.STEER_DRIVER_ALLOWANCE = 1400     # allowed driver torque before start limiting
++      self.STEER_DRIVER_MULTIPLIER = 5      # weight driver torque
++      self.STEER_DRIVER_FACTOR = 1           # from dbc
++      self.STEER_ERROR_MAX = 3500            # max delta between torque cmd and torque motor
++
++class TI_STATE:
++  DISCOVER = 0
++  OFF = 1
++  DRIVER_OVER = 2
++  RUN = 3
+ 
+ 
+ @dataclass
+@@ -36,42 +55,90 @@ class MazdaCarSpecs(CarSpecs):
+   tireStiffnessFactor: float = 0.7  # not optimized yet
+ 
+ 
+-class MazdaFlags(IntFlag):
+-  # Static flags
+-  # Gen 1 hardware: same CAN messages and same camera
++class MazdaSafetyFlags(IntFlag):
++  # Safety flags
+   GEN1 = 1
++  GEN2 = 2
++  GEN3 = 4
++  TORQUE_INTERCEPTOR = 8
++  RADAR_INTERCEPTOR = 16
++  NO_FSC = 32
++  NO_MRCC = 64
++  MANUAL_TRANSMISSION = 128
+ 
+ 
+ @dataclass
+ class MazdaPlatformConfig(PlatformConfig):
+   dbc_dict: DbcDict = field(default_factory=lambda: {Bus.pt: 'mazda_2017'})
+-  flags: int = MazdaFlags.GEN1
++  def init(self):
++    if self.flags & MazdaSafetyFlags.GEN2:
++      self.dbc_dict = {Bus.pt: 'mazda_2019'}
++    elif self.flags & MazdaSafetyFlags.GEN1 and self.flags & MazdaSafetyFlags.RADAR_INTERCEPTOR:
++      self.dbc_dict = {Bus.pt: 'mazda_2017', Bus.radar: 'mazda_radar'}
++    elif self.flags & MazdaSafetyFlags.GEN3:
++      self.dbc_dict = {Bus.pt: 'mazda_2023'}
+ 
+ 
+ class CAR(Platforms):
+   MAZDA_CX5 = MazdaPlatformConfig(
+     [MazdaCarDocs("Mazda CX-5 2017-21")],
+-    MazdaCarSpecs(mass=3655 * CV.LB_TO_KG, wheelbase=2.7, steerRatio=15.5)
++    MazdaCarSpecs(mass=3655 * CV.LB_TO_KG, wheelbase=2.7, steerRatio=15.5, centerToFrontRatio=0.41),
++    flags=MazdaSafetyFlags.GEN1,
++  )
++  MAZDA_CX8 = MazdaPlatformConfig(
++    [MazdaCarDocs("Mazda CX-8 2018-23")],
++    MazdaCarSpecs(mass=4314 * CV.LB_TO_KG, wheelbase=2.930, steerRatio=15.5, centerToFrontRatio=0.41),
++    flags=MazdaSafetyFlags.GEN1,
+   )
+   MAZDA_CX9 = MazdaPlatformConfig(
+     [MazdaCarDocs("Mazda CX-9 2016-20")],
+-    MazdaCarSpecs(mass=4217 * CV.LB_TO_KG, wheelbase=3.1, steerRatio=17.6)
++    MazdaCarSpecs(mass=4217 * CV.LB_TO_KG, wheelbase=3.1, steerRatio=17.6, centerToFrontRatio=0.41),
++    flags=MazdaSafetyFlags.GEN1,
+   )
+   MAZDA_3 = MazdaPlatformConfig(
+     [MazdaCarDocs("Mazda 3 2017-18")],
+-    MazdaCarSpecs(mass=2875 * CV.LB_TO_KG, wheelbase=2.7, steerRatio=14.0)
++    MazdaCarSpecs(mass=2875 * CV.LB_TO_KG, wheelbase=2.7, steerRatio=14.0, centerToFrontRatio=0.41),
++    flags=MazdaSafetyFlags.GEN1,
+   )
+   MAZDA_6 = MazdaPlatformConfig(
+     [MazdaCarDocs("Mazda 6 2017-20")],
+-    MazdaCarSpecs(mass=3443 * CV.LB_TO_KG, wheelbase=2.83, steerRatio=15.5)
++    MazdaCarSpecs(mass=3443 * CV.LB_TO_KG, wheelbase=2.83, steerRatio=15.5, centerToFrontRatio=0.41),
++    flags=MazdaSafetyFlags.GEN1,
+   )
+   MAZDA_CX9_2021 = MazdaPlatformConfig(
+     [MazdaCarDocs("Mazda CX-9 2021-23", video="https://youtu.be/dA3duO4a0O4")],
+-    MAZDA_CX9.specs
++    MAZDA_CX9.specs,
++    flags=MazdaSafetyFlags.GEN1,
+   )
+   MAZDA_CX5_2022 = MazdaPlatformConfig(
+     [MazdaCarDocs("Mazda CX-5 2022-25")],
+     MAZDA_CX5.specs,
++    flags=MazdaSafetyFlags.GEN1,
++  )
++  MAZDA_3_2019 = MazdaPlatformConfig(
++    [MazdaCarDocs("Mazda 3 2019-24")],
++    MazdaCarSpecs(mass=3300 * CV.LB_TO_KG, wheelbase=2.725, steerRatio=15.59, centerToFrontRatio=0.38),
++    flags=MazdaSafetyFlags.GEN2,
++  )
++  MAZDA_CX_30 = MazdaPlatformConfig(
++    [MazdaCarDocs("Mazda CX-30 2019-24")],
++    MazdaCarSpecs(mass=3375 * CV.LB_TO_KG, wheelbase=2.814, steerRatio=15.5, centerToFrontRatio=0.38),
++    flags=MazdaSafetyFlags.GEN2,
++  )
++  MAZDA_CX_50 = MazdaPlatformConfig(
++    [MazdaCarDocs("Mazda CX-50 2022-24")],
++    MazdaCarSpecs(mass=3375 * CV.LB_TO_KG, wheelbase=2.814, steerRatio=15.5, centerToFrontRatio=0.41),
++    flags=MazdaSafetyFlags.GEN2,
++  )
++  MAZDA_3_2023 = MazdaPlatformConfig(
++    [MazdaCarDocs("Mazda 3 2024-26")],
++    MazdaCarSpecs(mass=3300 * CV.LB_TO_KG, wheelbase=2.725, steerRatio=15.59, centerToFrontRatio=0.38),
++    flags=MazdaSafetyFlags.GEN3,
++  )
++  MAZDA_CX_30_2023 = MazdaPlatformConfig(
++    [MazdaCarDocs("Mazda CX-30 23-26")],
++    MazdaCarSpecs(mass=3375 * CV.LB_TO_KG, wheelbase=2.814, steerRatio=15.5, centerToFrontRatio=0.38),
++    flags=MazdaSafetyFlags.GEN3,
+   )
+ 
+ 
+@@ -79,6 +146,9 @@ class LKAS_LIMITS:
+   STEER_THRESHOLD = 15
+   DISABLE_SPEED = 45    # kph
+   ENABLE_SPEED = 52     # kph
++  TI_STEER_THRESHOLD = 6
++  TI_DISABLE_SPEED = 0    # kph
++  TI_ENABLE_SPEED = 0     # kph
+ 
+ 
+ class Buttons:
+@@ -87,6 +157,7 @@ class Buttons:
+   SET_MINUS = 2
+   RESUME = 3
+   CANCEL = 4
++  TURN_ON = 5
+ 
+ 
+ FW_QUERY_CONFIG = FwQueryConfig(
+@@ -97,7 +168,21 @@ FW_QUERY_CONFIG = FwQueryConfig(
+       [StdQueries.MANUFACTURER_SOFTWARE_VERSION_RESPONSE],
+       bus=0,
+     ),
++    Request(
++      [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.MANUFACTURER_SOFTWARE_VERSION_REQUEST],
++      [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.MANUFACTURER_SOFTWARE_VERSION_RESPONSE],
++      whitelist_ecus=[Ecu.engine],
++    ),
++    Request(
++      [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.MANUFACTURER_SOFTWARE_VERSION_REQUEST],
++      [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.MANUFACTURER_SOFTWARE_VERSION_RESPONSE],
++      bus=0,
++      whitelist_ecus=[Ecu.eps, Ecu.abs, Ecu.fwdRadar, Ecu.fwdCamera, Ecu.shiftByWire],
++    )
+   ],
+ )
+ 
+ DBC = CAR.create_dbc_map()
++GEN1 = CAR.with_flags(MazdaSafetyFlags.GEN1)
++GEN2 = CAR.with_flags(MazdaSafetyFlags.GEN2)
++GEN3 = CAR.with_flags(MazdaSafetyFlags.GEN3)
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/car/tests/routes.py b/opendbc_repo/opendbc/car/tests/routes.py
+index 33ab434..7caeecc 100644
+--- a/opendbc_repo/opendbc/car/tests/routes.py
++++ b/opendbc_repo/opendbc/car/tests/routes.py
+@@ -21,6 +21,13 @@ from opendbc.car.psa.values import CAR as PSA
+ # FIXME: add routes for these cars
+ non_tested_cars = [
+   MOCK.MOCK,
++  # Mazda Gen2/Gen3 and CX-8 (MoreTorque Torque Interceptor ports) have no public CI routes
++  MAZDA.MAZDA_CX8,
++  MAZDA.MAZDA_3_2019,
++  MAZDA.MAZDA_CX_30,
++  MAZDA.MAZDA_CX_50,
++  MAZDA.MAZDA_3_2023,
++  MAZDA.MAZDA_CX_30_2023,
+   GM.CADILLAC_ATS,
+   GM.CADILLAC_ESCALADE_ASCM,
+   GM.CADILLAC_ESCALADE_ESV_2019_ASCM,
+diff --git a/opendbc_repo/opendbc/car/torque_data/override.toml b/opendbc_repo/opendbc/car/torque_data/override.toml
+index 33c6304..319108a 100644
+--- a/opendbc_repo/opendbc/car/torque_data/override.toml
++++ b/opendbc_repo/opendbc/car/torque_data/override.toml
+@@ -157,3 +157,8 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ 
+ "CHEVROLET_MALIBU_CC" = [1.85, 1.85, 0.075]
+ "CHEVROLET_TRAX" = [0.95, 0.95, 0.17]
++"MAZDA_3_2019" = [1.45, 3.0, 0.33]
++"MAZDA_CX_30" = [1.45, 3.0, 0.238]
++"MAZDA_CX_50" = [1.45, 3.0, 0.33]
++"MAZDA_3_2023" = [1.45, 3.0, 0.33]
++"MAZDA_CX_30_2023" = [1.45, 3.0, 0.3]
+diff --git a/opendbc_repo/opendbc/car/torque_data/substitute.toml b/opendbc_repo/opendbc/car/torque_data/substitute.toml
+index 7af94bb..6f626ff 100644
+--- a/opendbc_repo/opendbc/car/torque_data/substitute.toml
++++ b/opendbc_repo/opendbc/car/torque_data/substitute.toml
+@@ -2,6 +2,7 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "MAZDA_3" = "MAZDA_CX9_2021"
+ "MAZDA_6" = "MAZDA_CX9_2021"
+ "MAZDA_CX5" = "MAZDA_CX9_2021"
++"MAZDA_CX8" = "MAZDA_CX9_2021"
+ "MAZDA_CX5_2022" = "MAZDA_CX9_2021"
+ "MAZDA_CX9" = "MAZDA_CX9_2021"
+ 
+diff --git a/opendbc_repo/opendbc/dbc/mazda_2017.dbc b/opendbc_repo/opendbc/dbc/mazda_2017.dbc
+index d2bb77b..f57543b 100644
+--- a/opendbc_repo/opendbc/dbc/mazda_2017.dbc
++++ b/opendbc_repo/opendbc/dbc/mazda_2017.dbc
+@@ -36,6 +36,22 @@ BS_:
+ BU_: XXX
+ 
+ 
++
++BO_ 585 CAM_LKAS2: 8 XXX
++ SG_ LKAS_REQUEST : 3|12@0+ (1,-2048) [0|2048] "" XXX
++ SG_ CHKSUM : 19|12@0+ (1,-2048) [0|2048] "" XXX
++ SG_ KEY : 39|32@0+ (1,0) [3294744159|3294744161] "" XXX
++
++BO_ 586 TI_FEEDBACK: 8 XXX
++ SG_ TI_TORQUE_SENSOR : 7|8@0+ (1,-127) [-85|85] "" XXX
++ SG_ CHKSUM : 15|8@0+ (1,-127) [-127|128] "" XXX
++ SG_ VERSION_NUMBER : 23|8@0+ (1,0) [0|255] "" XXX
++ SG_ STATE : 31|8@0+ (1,0) [0|3] "" XXX
++ SG_ VIOL : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ ERROR : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ RAMP_DOWN : 55|8@0+ (1,0) [0|1] "" XXX
++ SG_ SPARE : 63|8@0+ (1,0) [0|255] "" XXX
++
+ BO_ 117 STEER_RELATED: 8 XXX
+  SG_ CTR : 7|8@0+ (1,0) [0|255] "" XXX
+  SG_ NEW_SIGNAL_1 : 48|1@0+ (1,0) [0|1] "" XXX
+@@ -57,6 +73,7 @@ BO_ 514 ENGINE_DATA: 8 XXX
+  SG_ PEDAL_GAS : 39|12@0+ (1,0) [0|255] "%" XXX
+ 
+ BO_ 357 PEDALS: 8 XXX
++ SG_ CRZ_AVAILABLE : 1|1@0+ (1,0) [0|1] "" XXX
+  SG_ NEW_SIGNAL_6 : 31|4@0+ (1,0) [0|1] "" XXX
+  SG_ NEW_SIGNAL_7 : 8|3@1+ (1,0) [0|7] "" XXX
+  SG_ ACC_ACTIVE : 3|1@0+ (1,0) [0|1] "" XXX
+@@ -326,26 +343,6 @@ BO_ 1034 MSG_07: 8 XXX
+  SG_ NEW_SIGNAL_8 : 39|8@0+ (1,0) [0|255] "" XXX
+  SG_ NEW_SIGNAL_9 : 31|8@0+ (1,0) [0|255] "" XXX
+ 
+-BO_ 870 RADAR_366_STATIC: 8 XXX
+- SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_2 : 15|8@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_3 : 23|8@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_4 : 31|8@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_5 : 39|8@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_6 : 47|8@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_7 : 55|8@0+ (1,0) [0|255] "" XXX
+-
+-BO_ 867 RADAR_363: 8 XXX
+- SG_ CTR : 59|4@0+ (1,0) [0|255] "" XXX
+- SG_ STATIC_4 : 43|16@0+ (1,0) [0|255] "" XXX
+- SG_ FLIPPY_1 : 31|3@0+ (1,0) [0|7] "" XXX
+- SG_ FLIPPY_2 : 47|1@0+ (1,0) [0|15] "" XXX
+- SG_ FLIPPY_4 : 44|1@0+ (1,0) [0|3] "" XXX
+- SG_ FLIPPY_3 : 46|1@0+ (1,0) [0|3] "" XXX
+- SG_ CURVE_1 : 7|12@0+ (1,0) [0|255] "" XXX
+- SG_ CURVE_2 : 11|12@0+ (1,0) [0|255] "" XXX
+- SG_ CURVE_3 : 28|13@0+ (1,0) [0|255] "" XXX
+-
+ BO_ 130 STEER: 8 XXX
+  SG_ NEW_SIGNAL_5 : 55|8@0+ (1,0) [0|255] "" XXX
+  SG_ NEW_SIGNAL_6 : 63|8@0+ (1,0) [0|255] "" XXX
+@@ -363,14 +360,6 @@ BO_ 304 GEAR_RELATED: 8 XXX
+  SG_ NEW_SIGNAL_1 : 55|8@0+ (1,0) [0|255] "" XXX
+  SG_ NEW_SIGNAL_2 : 47|8@0+ (1,0) [0|255] "" XXX
+ 
+-BO_ 865 RADAR_DISTANCE: 8 XXX
+- SG_ CTR : 56|4@1+ (1,0) [0|15] "" XXX
+- SG_ STATIC : 36|3@0+ (1,0) [0|31] "" XXX
+- SG_ DISTANCE_RELATED : 33|4@0+ (1,0) [0|3] "" XXX
+- SG_ SPEED_INVERSE : 43|12@0- (-0.225,0) [0|255] "kph" XXX
+- SG_ DISTANCE_LEAD : 7|24@0+ (1,0) [0|31] "" XXX
+- SG_ RELATIVE_VEL_LEAD : 31|11@0- (1,0) [0|255] "" XXX
+-
+ BO_ 836 NEW_MSG_19: 8 XXX
+  SG_ CTR : 48|4@1+ (1,0) [0|15] "" XXX
+  SG_ CTR2 : 63|8@0+ (1,0) [0|255] "" XXX
+@@ -383,17 +372,6 @@ BO_ 832 SEATBELT: 8 XXX
+  SG_ NEW_SIGNAL_4 : 8|4@1+ (1,0) [0|3] "" XXX
+  SG_ DRIVER_SEATBELT : 27|1@0+ (1,0) [0|1] "" XXX
+ 
+-BO_ 866 RADAR_TURN: 8 XXX
+- SG_ CTR : 59|4@0+ (1,0) [0|15] "" XXX
+- SG_ STEER_ANGLE : 43|12@0+ (-1,2048) [0|7] "" XXX
+- SG_ STATIC_2 : 63|4@0+ (1,0) [0|15] "" XXX
+- SG_ CURVE_1 : 7|12@0+ (1,0) [0|131071] "" XXX
+- SG_ CURVE_2 : 11|12@0- (1,0) [0|127] "" XXX
+- SG_ FLIPPY_1 : 44|1@0+ (1,0) [0|15] "" XXX
+- SG_ NEW_SIGNAL_4 : 34|3@1+ (1,0) [0|3] "" XXX
+- SG_ CURVE_3 : 31|11@0- (1,0) [0|63] "" XXX
+- SG_ NEW_SIGNAL_1 : 33|4@0+ (1,0) [0|3] "" XXX
+-
+ BO_ 158 MSG_05: 8 XXX
+  SG_ NEW_SIGNAL_1 : 23|8@0+ (1,0) [0|15] "" XXX
+  SG_ NEW_SIGNAL_2 : 47|8@0+ (1,0) [0|255] "" XXX
+@@ -511,26 +489,6 @@ BO_ 542 NEW_MSG_33: 8 XXX
+  SG_ CTR : 48|4@1+ (1,0) [0|15] "" XXX
+  SG_ CTR2 : 56|4@1+ (1,0) [0|15] "" XXX
+ 
+-BO_ 868 RADAR_364: 8 XXX
+- SG_ CTR : 59|4@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_1 : 7|12@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_2 : 11|12@0- (1,0) [0|15] "" XXX
+- SG_ NEW_SIGNAL_3 : 27|12@0- (1,0) [0|255] "" XXX
+- SG_ FLIPPERS_1 : 31|4@0+ (1,0) [0|15] "" XXX
+- SG_ NEW_SIGNAL_4 : 44|1@1+ (1,0) [0|3] "" XXX
+- SG_ FLIPPY_1 : 46|1@0+ (1,0) [0|3] "" XXX
+- SG_ STATIC_1 : 47|1@0+ (1,0) [0|15] "" XXX
+- SG_ STATIC_2 : 43|16@0+ (1,0) [0|7] "" XXX
+-
+-BO_ 869 RADAR_365: 8 XXX
+- SG_ CTR : 59|4@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_4 : 39|6@0+ (1,0) [0|63] "" XXX
+- SG_ NEW_SIGNAL_1 : 7|14@0+ (1,0) [0|65535] "" XXX
+- SG_ RELATED_1 : 9|18@0+ (1,0) [0|3] "" XXX
+- SG_ RELATED_2 : 33|18@0+ (1,0) [0|15] "" XXX
+- SG_ STATIC : 61|2@0+ (1,0) [0|3] "" XXX
+- SG_ NEW_SIGNAL_2 : 63|2@0+ (1,0) [0|15] "" XXX
+-
+ BO_ 1114 NEW_MSG_4: 8 XXX
+ 
+ BO_ 535 CURVE_CTRS: 8 XXX
+@@ -555,37 +513,36 @@ BO_ 535 CURVE_CTRS: 8 XXX
+  SG_ NEW_SIGNAL_4 : 9|1@0+ (1,0) [0|1] "" XXX
+ 
+ BO_ 540 CRZ_CTRL: 8 XXX
+- SG_ NEW_SIGNAL_6 : 10|1@0+ (1,0) [0|1] "" XXX
+- SG_ NEW_SIGNAL_9 : 31|1@0+ (1,0) [0|255] "" XXX
+- SG_ ACC_GAS_MAYBE2 : 29|1@0+ (1,0) [0|1] "" XXX
+- SG_ HANDS_OFF_STEERING : 48|1@0+ (1,0) [0|1] "" XXX
+- SG_ HANDS_ON_STEER_WARN : 59|4@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 2|11@0+ (1,0) [0|1] "" XXX
+  SG_ CRZ_ACTIVE : 3|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 7|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_8 : 16|1@0+ (1,0) [0|1] "" XXX
+  SG_ CRZ_AVAILABLE : 17|1@0+ (1,0) [0|255] "" XXX
+  SG_ DISTANCE_SETTING : 20|3@0+ (1,0) [0|7] "" XXX
+- SG_ MSG_1_INV : 1|1@0+ (1,0) [0|1] "" XXX
+- SG_ MSG_1_COPY : 9|1@0+ (1,0) [0|1] "" XXX
+- SG_ ACC_GAS_MAYBE : 23|1@0+ (1,0) [0|31] "" XXX
+- SG_ ACC_ACTIVE_2 : 52|1@0+ (1,0) [0|1] "" XXX
+- SG_ NEW_SIGNAL_10 : 30|1@0+ (1,0) [0|1] "" XXX
+- SG_ MSG_1 : 0|1@0+ (1,0) [0|3] "" XXX
+- SG_ 5_SEC_DISABLE_TIMER : 45|3@0+ (1,0) [0|7] "" XXX
+- SG_ NEW_SIGNAL_3 : 13|1@0+ (1,0) [0|3] "" XXX
+- SG_ MSG_1_INV_COPY : 8|1@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_7 : 22|2@0+ (1,0) [0|3] "" XXX
+  SG_ RADAR_HAS_LEAD : 23|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_9 : 28|15@0+ (1,0) [0|16383] "" XXX
+  SG_ RADAR_LEAD_RELATIVE_DISTANCE : 31|3@0+ (1,0) [0|5] "" XXX
++ SG_ NEW_SIGNAL_5 : 42|6@0+ (1,0) [0|3] "" XXX
++ SG_ DISABLE_TIMER_1 : 43|3@1+ (1,0) [0|7] "" XXX
++ SG_ DISABLE_TIMER_2 : 48|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_6 : 49|3@1+ (1,0) [0|3] "" XXX
++ SG_ ACC_ACTIVE_2 : 52|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 63|8@0+ (1,0) [0|3] "" XXX
+ 
+ BO_ 539 CRZ_INFO: 8 XXX
+- SG_ CTR1 : 55|8@0+ (1,0) [0|255] "" XXX
++ SG_ STATUS : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ STATIC_1 : 15|11@0+ (1,0) [0|2047] "" XXX
++ SG_ ACCEL_CMD : 17|13@0+ (1,-4096) [0|8191] "" XXX
++ SG_ STATIC_2 : 18|3@1+ (1,0) [0|7] "" XXX
+  SG_ ACC_ACTIVE : 33|1@0+ (1,0) [0|1] "" XXX
+- SG_ CHKSUM : 63|8@0+ (1,0) [0|255] "" XXX
+- SG_ NEW_SIGNAL_7 : 47|1@0+ (1,0) [0|255] "" XXX
+  SG_ ACC_SET_ALLOWED : 34|1@0+ (1,0) [0|1] "" XXX
+  SG_ CRZ_ENDED : 36|1@0+ (1,0) [0|255] "" XXX
+- SG_ ACCEL_CMD : 17|13@0+ (1,-4096) [0|1] "" XXX
+- SG_ STATIC_1 : 15|11@0+ (1,0) [0|16383] "" XXX
+- SG_ STATIC_2 : 18|3@1+ (1,0) [0|3] "" XXX
+- SG_ ERROR_STATUS : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ STOPPING_MAYBE : 42|1@0+ (1,0) [0|1] "" XXX
++ SG_ MYSTERY_BIT : 47|1@0+ (1,0) [0|255] "" XXX
++ SG_ CTR1 : 51|4@0+ (1,0) [0|255] "" XXX
++ SG_ STOPPING_MAYBE2 : 52|1@0+ (1,0) [0|1] "" XXX
++ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" XXX
+ 
+ BO_ 121 EPB: 8 XXX
+  SG_ NEW_SIGNAL_1 : 4|4@0+ (1,0) [0|255] "" XXX
+@@ -753,6 +710,39 @@ BO_ 1171 MOB3: 8 XXX
+ 
+ BO_ 1248 MOB4: 8 XXX
+ 
++BO_ 865 RADAR_361: 8 XXX
++ SG_ MSGS_1 : 7|32@0+ (1,0) [0|4294967295] "" XXX
++ SG_ MSGS_2 : 39|12@0+ (1,0) [0|268435455] "" XXX
++ SG_ INVERSE_SPEED : 43|12@0- (1,0) [0|4095] "" XXX
++ SG_ CTR : 59|4@0+ (1,0) [0|15] "" XXX
++ SG_ BIT : 63|1@0+ (1,0) [0|15] "" XXX
++
++BO_ 866 RADAR_362: 8 XXX
++ SG_ MSGS_1 : 7|32@0+ (1,0) [0|4294967295] "" XXX
++ SG_ MSGS_2 : 39|12@0+ (1,0) [0|268435455] "" XXX
++ SG_ CLIPPED_STEER_ANGLE : 43|12@0+ (1,0) [0|4095] "" XXX
++ SG_ CTR : 59|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 867 RADAR_363: 8 XXX
++ SG_ MSGS_1 : 7|32@0+ (1,0) [0|4294967295] "" XXX
++ SG_ MSGS_2 : 39|28@0+ (1,0) [0|268435455] "" XXX
++ SG_ CTR : 59|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 868 RADAR_364: 8 XXX
++ SG_ MSGS_1 : 7|32@0+ (1,0) [0|4294967295] "" XXX
++ SG_ MSGS_2 : 39|28@0+ (1,0) [0|268435455] "" XXX
++ SG_ CTR : 59|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 869 RADAR_365: 8 XXX
++ SG_ MSGS_1 : 7|32@0+ (1,0) [0|4294967295] "" XXX
++ SG_ MSGS_2 : 39|28@0+ (1,0) [0|268435455] "" XXX
++ SG_ CTR : 59|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 870 RADAR_366: 8 XXX
++ SG_ MSGS_1 : 7|32@0+ (1,0) [0|4294967295] "" XXX
++ SG_ MSGS_2 : 39|28@0+ (1,0) [0|268435455] "" XXX
++ SG_ CTR : 59|4@0+ (1,0) [0|15] "" XXX
++
+ BO_ 1177 RADAR_499_STATIC: 8 XXX
+ 
+ 
+@@ -788,4 +778,4 @@ VAL_ 552 GEAR 1 "P" 2 "R" 3 "N" 4 "D" ;
+ VAL_ 540 RADAR_HAS_LEAD 0 "NO LEAD" 1 "HAS LEAD" ;
+ VAL_ 540 RADAR_LEAD_RELATIVE_DISTANCE 0 "NO LEAD" 1 "FARTHEST" 2 "4" 3 "3" 4 "2" 5 "NEAREST" ;
+ VAL_ 1143 LEFT_BS_STATUS 0 "No object detected" 1 "Object detected in left blindspot" 2 "Object detected in left blindspot with blinker - warning"
+-VAL_ 1143 RIGHT_BS_STATUS 0 "No object detected" 1 "Object detected in right blindspot" 2 "Object detected in right blindspot with blinker - warning"
++VAL_ 1143 RIGHT_BS_STATUS 0 "No object detected" 1 "Object detected in right blindspot" 2 "Object detected in right blindspot with blinker - warning"
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/dbc/mazda_2019.dbc b/opendbc_repo/opendbc/dbc/mazda_2019.dbc
+new file mode 100644
+index 0000000..c683af6
+--- /dev/null
++++ b/opendbc_repo/opendbc/dbc/mazda_2019.dbc
+@@ -0,0 +1,630 @@
++VERSION ""
++
++
++NS_ :
++    NS_DESC_
++    CM_
++    BA_DEF_
++    BA_
++    VAL_
++    CAT_DEF_
++    CAT_
++    FILTER
++    BA_DEF_DEF_
++    EV_DATA_
++    ENVVAR_DATA_
++    SGTYPE_
++    SGTYPE_VAL_
++    BA_DEF_SGTYPE_
++    BA_SGTYPE_
++    SIG_TYPE_REF_
++    VAL_TABLE_
++    SIG_GROUP_
++    SIG_VALTYPE_
++    SIGTYPE_VALTYPE_
++    BO_TX_BU_
++    BA_DEF_REL_
++    BA_REL_
++    BA_DEF_DEF_REL_
++    BU_SG_REL_
++    BU_EV_REL_
++    BU_BO_REL_
++    SG_MUL_VAL_
++
++BS_:
++
++BU_: XXX
++
++BO_ 16 STEER_TORQUE_VB: 8 XXX
++ SG_ STEER_TORQUE_SENSOR : 5|13@0+ (1,-4000) [0|15] "" XXX
++ SG_ NEW_SIGNAL_12 : 7|2@0+ (1,0) [0|15] "" XXX
++ SG_ STEER_TORQUE_MOTOR : 8|13@0+ (0.05,-205) [0|15] "" XXX
++ SG_ BRAKE_PREASURE : 27|12@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 43|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_5 : 47|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0- (1,0) [0|15] "" XXX
++
++BO_ 17 STEER_TORQUE_VB_2: 8 XXX
++ SG_ STEER_TORQUE_MOTOR : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 27|14@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 45|6@0+ (1,0) [0|15] "" XXX
++ SG_ CTR : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_5 : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 18 STEER_VB: 8 XXX
++ SG_ STEER_ANGLE : 25|14@0- (1,375) [0|65536] "" XXX
++ SG_ STEER_LEFT_BIT : 26|1@0+ (1,0) [0|1] "" XXX
++ SG_ CTR : 41|2@0+ (1,0) [0|3] "" XXX
++ SG_ ENGINE_OFF : 43|2@0+ (1,0) [0|63] "" XXX
++ SG_ NEW_SIGNAL_2 : 53|6@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 55|2@0+ (1,0) [0|15] "" XXX
++
++BO_ 20 NEW_MSG_29: 8 XXX
++ SG_ RIGHT_BLINK_CLOCK : 23|8@0+ (1,0) [0|1] "" XXX
++
++BO_ 22 CRZ_CTRL_BTNS: 8 XXX
++ SG_ SIGNAL : 45|1@0+ (1,0) [0|15] "" XXX
++ SG_ NOT_SIGNAL : 46|1@0+ (1,0) [0|3] "" XXX
++ SG_ CRZ_CTRL_BTN_PRESSED : 48|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 51|3@0+ (1,0) [0|7] "" XXX
++
++BO_ 24 BRAKE_PEDAL_VB: 8 XXX
++ SG_ BRAKE_PEDAL_PRESSED_AND_ENGINE_ON : 0|1@0+ (1,0) [0|3] "" XXX
++ SG_ NOT_BRAKE_PEDAL_PRESSED : 6|1@0+ (1,0) [0|3] "" XXX
++ SG_ BRAKE_PEDAL_PRESSED : 7|1@0+ (1,0) [0|65535] "" XXX
++ SG_ NOT_BRAKE_PEDAL_PRESSED_AND_ENGINE_ON : 15|1@0+ (1,0) [0|7] "" XXX
++
++BO_ 26 ENGINE_DATA_VB: 8 XXX
++ SG_ RPM : 7|13@0+ (1,0) [0|15] "" XXX
++ SG_ PEDAL_GAS : 39|10@0+ (1,0) [0|15] "" XXX
++ SG_ ENGINE_ON : 52|1@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0- (1,0) [0|15] "" XXX
++
++BO_ 29 WHEEL: 8 XXX
++ SG_ ENCODER_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ ENCODER_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ SPEED : 39|16@0+ (1,0) [0|127] "" XXX
++ SG_ NEW_SIGNAL_2 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STANDSTILL : 52|1@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_6 : 55|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_1 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 31 GEAR_VB: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ GEAR : 36|4@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 37 BLANK_1: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 44 BLANK_2: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|16777215] "" XXX
++ SG_ NEW_SIGNAL_4 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 39|16@0+ (1,0) [0|16777215] "" XXX
++ SG_ NEW_SIGNAL_3 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 59 STEER_RATE: 8 XXX
++ SG_ STEER_ANGLE : 23|16@0+ (0.05,-1600) [-500|500] "" XXX
++ SG_ CHKSUM : 39|8@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 43|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 47|4@0+ (1,0) [0|15] "" XXX
++ SG_ STEER_ANGLE_RATE : 55|8@0+ (0.05,0) [0|65535] "" XXX
++
++BO_ 96 STEER2: 8 XXX
++ SG_ STEER__ : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ SPEED : 18|16@0- (0.00621371,-62.1371) [-65635|65635] "MPH" XXX
++ SG_ CAR_MOVING_FORWARD : 21|1@0+ (1,0) [0|15] "" XXX
++ SG_ CAR_REVERSING : 22|1@0+ (1,0) [0|1] "" XXX
++ SG_ ENGINE_OFF : 23|1@0+ (1,0) [0|1] "" XXX
++ SG_ TURN_OFF : 32|1@0+ (1,0) [0|1] "" XXX
++ SG_ ENGINE_ON : 33|1@0+ (1,0) [0|1] "" XXX
++ SG_ TURN_ON : 34|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 45|1@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_5 : 48|4@1+ (1,0) [0|15] "" XXX
++ SG_ CTR : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 117 NEW_MSG_31_MAIN: 8 XXX
++
++BO_ 120 BCM_ECHO_MAYBE: 8 XXX
++ SG_ EPS_MOTOR_TORQUE_MAYBE : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ BRAKE_MAYBE : 39|8@0+ (1,0) [0|65535] "" XXX
++
++BO_ 121 NEW_MSG_39: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 16|2@1+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|10@0+ (1,0) [0|3] "" XXX
++
++BO_ 128 RADARS: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 15|1@0+ (1,0) [0|255] "" XXX
++ SG_ REAR_LEFT : 17|1@0+ (1,0) [0|1] "" XXX
++ SG_ FRONT_RIGHT : 18|1@0+ (1,0) [0|1] "" XXX
++ SG_ FRONT_LEFT : 19|1@0+ (1,0) [0|255] "" XXX
++ SG_ REAR_RIGHT : 20|1@0+ (1,0) [0|15] "" XXX
++ SG_ FRONT : 21|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 59|4@0+ (1,0) [0|255] "" XXX
++
++BO_ 129 NEW_MSG_19: 8 XXX
++ SG_ NEW_SIGNAL_2 : 15|1@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 31|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 47|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_5 : 56|8@1+ (1,0) [0|15] "" XXX
++
++BO_ 130 STEER: 8 XXX
++ SG_ STEER_ANGLE : 23|16@0+ (0.05,-1600) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ STEER_RATE : 55|16@0- (0.03,0) [0|65535] "" XXX
++
++BO_ 133 STOCK_LKAS: 8 XXX
++ SG_ CTR : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ STEER_ANGLE : 15|16@0+ (0.048,-2360) [0|255] "" XXX
++ SG_ FLIPPYS : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ ONES : 39|13@0+ (1,0) [0|255] "" XXX
++ SG_ LKAS_REQUEST : 42|11@0+ (1,-630) [0|1023] "" XXX
++ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" XXX
++
++BO_ 134 STEER_ANGLE2: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ STEER_ANGLE : 25|14@0- (0.1,36) [0|1023] "" XXX
++
++BO_ 136 NEW_MSG_40: 8 XXX
++ SG_ NEW_SIGNAL_4 : 4|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 5|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_6 : 6|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 36|13@0+ (1,0) [0|8191] "" XXX
++ SG_ NEW_SIGNAL_2 : 59|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 60|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 143 BRAKE_PEDAL_PARK: 4 XXX
++ SG_ BRAKE_PRESSED_IN_PARK : 1|1@1+ (1,0) [0|3] "" XXX
++
++BO_ 145 BLINK_INFO: 8 XXX
++ SG_ RIGHT_BLINK : 12|1@0+ (1,0) [0|3] "" XXX
++ SG_ LEFT_BLINK : 13|1@0+ (1,0) [0|3] "" XXX
++ SG_ Speed : 27|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 40|8@1+ (1,0) [0|255] "" XXX
++ SG_ CTR : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|15] "" XXX
++
++BO_ 155 NEW_MSG_43: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|16777215] "" XXX
++ SG_ NEW_SIGNAL_2 : 15|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 157 CRZ_BTNS: 8 XXX
++ SG_ RES : 2|1@0+ (1,0) [0|1] "" XXX
++ SG_ SET_M : 3|1@0+ (1,0) [0|1] "" XXX
++ SG_ SET_P : 4|1@0+ (1,0) [0|1] "" XXX
++ SG_ CAN : 5|1@0+ (1,0) [0|1] "" XXX
++ SG_ STATIC_0 : 7|2@0+ (1,0) [0|7] "" XXX
++ SG_ STATIC_1 : 10|7@0+ (1,0) [0|15] "" XXX
++ SG_ MODE_LKAS : 11|1@0+ (1,0) [0|1] "" XXX
++ SG_ MODE_ACC : 13|1@0+ (1,0) [0|3] "" XXX
++ SG_ STATIC_2 : 19|32@0+ (1,0) [0|7] "" XXX
++ SG_ CTR : 48|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 56|8@1+ (1,0) [0|63] "" XXX
++
++BO_ 159 BRAKE_PEDAL: 8 XXX
++ SG_ REVERSE : 1|1@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_1 : 2|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 4|1@1+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 40|6@1+ (1,0) [0|15] "" XXX
++ SG_ BRAKE_NOT_PRESSED : 58|1@0+ (1,0) [0|1] "" XXX
++ SG_ BRAKE_PRESSED : 59|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 253 NEW_MSG_34: 8 XXX
++ SG_ NEW_SIGNAL_1 : 36|5@0+ (1,0) [0|31] "" XXX
++
++BO_ 256 CAM_Start: 8 XXX
++ SG_ DISTANCE_LEAD_CAR : 0|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 2|2@0+ (1,0) [0|1] "" XXX
++ SG_ ACTIVE_TARGET : 4|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 20|12@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_5 : 24|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_10 : 44|12@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_7 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_8 : 61|2@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 63|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 257 LKAS: 8 XXX
++ SG_ LEAD_DIST : 0|12@0+ (1,0) [0|255] "" XXX
++ SG_ SET_19 : 2|2@0+ (1,0) [0|255] "" XXX
++ SG_ ANGLE_TARGET : 20|12@0+ (1,0) [0|4095] "" XXX
++ SG_ UNKNOWN : 24|12@0+ (1,0) [0|4095] "" XXX
++ SG_ MAX_TORQUE__ : 44|12@0- (1,0) [0|4095] "" XXX
++ SG_ SET_0 : 48|1@1+ (1,0) [0|3] "" XXX
++ SG_ CTR : 59|4@0+ (1,0) [0|255] "" XXX
++ SG_ CTR_ACT : 61|2@0+ (1,0) [0|3] "" XXX
++ SG_ SET_0_1 : 63|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 258 NEW_MSG_3: 8 XXX
++ SG_ NEW_SIGNAL_6 : 1|2@1+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_1 : 13|10@0- (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 18|10@0- (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|10@0- (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 44|10@0- (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 59|4@0+ (1,0) [0|255] "" XXX
++
++BO_ 259 NEW_MSG_5: 8 XXX
++ SG_ NEW_SIGNAL_1 : 0|12@0- (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 19|11@0- (1,0) [0|10000000] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|10@0- (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 44|10@0- (1,0) [0|1] "" XXX
++
++BO_ 260 NEW_MSG_6: 8 XXX
++ SG_ NEW_SIGNAL_1 : 0|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 20|12@0- (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 24|12@0+ (1,0) [0|1] "" XXX
++
++BO_ 261 NEW_MSG_7: 8 XXX
++ SG_ NEW_SIGNAL_1 : 15|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 262 NEW_MSG_8: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 15|8@0- (1,0) [0|255] "" XXX
++
++BO_ 263 NEW_MSG_9: 8 XXX
++ SG_ NEW_SIGNAL_1 : 15|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 264 NEW_MSG_2: 8 XXX
++ SG_ CRZ_CTRL_PRESSED : 48|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 49|3@1+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_1 : 56|8@1+ (1,0) [0|15] "" XXX
++
++BO_ 273 NEW_MSG_26: 8 XXX
++ SG_ NEW_SIGNAL_1 : 23|4@0+ (1,0) [0|3] "" XXX
++
++BO_ 274 NEW_MSG_27: 8 XXX
++ SG_ NEW_SIGNAL_1 : 39|8@0+ (1,0) [0|1] "" XXX
++
++BO_ 277 NEW_MSG_24: 8 XXX
++ SG_ NEW_SIGNAL_1 : 47|8@0+ (1,0) [0|1] "" XXX
++
++BO_ 278 NEW_MSG_25: 8 XXX
++
++BO_ 288 NEW_MSG_30: 8 XXX
++
++BO_ 289 NEW_MSG_28: 8 XXX
++ SG_ NEW_SIGNAL_1 : 55|8@0+ (1,0) [0|1] "" XXX
++
++BO_ 290 NEW_MSG_23: 8 XXX
++ SG_ NEW_SIGNAL_1 : 31|5@0+ (1,0) [0|255] "" XXX
++
++BO_ 291 NEW_MSG_22: 8 XXX
++ SG_ NEW_SIGNAL_1 : 39|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 292 NEW_MSG_18: 8 XXX
++ SG_ NEW_SIGNAL_1 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 293 NEW_MSG_12: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 19|4@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 39|16@0+ (1,0) [0|255] "" XXX
++
++BO_ 294 NEW_MSG_13: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|16@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 59|4@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 61|2@0+ (1,0) [0|1] "" XXX
++
++BO_ 304 CAM_LANES: 8 XXX
++ SG_ DISTANCE_TO_LEFT_LANE : 1|10@0- (1,0) [0|1] "" XXX
++ SG_ RIGHT_LANE_DETECTED : 4|1@0+ (1,0) [0|255] "" XXX
++ SG_ LEFT_LANE_DETECTED : 7|1@0+ (1,0) [0|1] "" XXX
++ SG_ DISTANCE_TO_RIGHT_LANE : 23|10@0- (1,0) [0|2047] "" XXX
++ SG_ DISTANCE_TO_LEFT_LANE_LOW_RES : 29|8@0+ (1,0) [0|4095] "" XXX
++ SG_ DISTANCE_TO_RIGHT_LANE_LOW_RES : 37|8@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 59|4@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 305 CAM_LANES_2_MAYBE: 8 XXX
++ SG_ NEW_SIGNAL_4 : 23|8@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_6 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 306 CAM_LANE_3_MAYBE: 8 XXX
++ SG_ STEER : 7|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 13|10@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 19|10@0+ (1,0) [0|63] "" XXX
++ SG_ NEW_SIGNAL_4 : 25|10@0+ (1,0) [0|1] "" XXX
++ SG_ LANE_DETECTED_1 : 44|1@0+ (1,0) [0|1] "" XXX
++ SG_ LANE_DETECTED_2 : 45|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 307 NEW_MSG_1: 8 XXX
++ SG_ NEW_SIGNAL_4 : 7|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 13|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 19|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 25|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 61|6@0+ (1,0) [0|1] "" XXX
++
++BO_ 308 ACC_POSSIBLY: 8 XXX
++ SG_ NEW_SIGNAL_2 : 0|7@0+ (1,0) [0|63] "" XXX
++ SG_ NEW_SIGNAL_6 : 4|1@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 18|7@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_5 : 36|7@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_7 : 37|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 54|7@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_8 : 55|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 310 NEW_MSG_10: 8 XXX
++ SG_ NEW_SIGNAL_2 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 56|4@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 320 NEW_MSG_4: 8 XXX
++ SG_ NEW_SIGNAL_4 : 16|1@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 27|7@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 36|9@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 43|6@0+ (1,0) [0|1] "" XXX
++
++BO_ 321 NEW_MSG_11: 8 XXX
++ SG_ NEW_SIGNAL_1 : 5|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 32|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 336 NEW_MSG_20: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|8@0+ (1,0) [0|4095] "" XXX
++ SG_ NEW_SIGNAL_1 : 11|12@0+ (1,0) [0|127] "" XXX
++ SG_ NEW_SIGNAL_3 : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 47|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 342 NEW_MSG_21: 8 XXX
++ SG_ NEW_SIGNAL_7 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_8 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_5 : 39|16@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_6 : 40|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 48|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 63|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 352 NEW_MSG_14: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 354 CAM_KEEP_ALIVE_1: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|30@0+ (1,0) [0|65535] "" XXX
++
++BO_ 355 NEW_MSG_15: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|127] "" XXX
++
++BO_ 356 NEW_MSG_16: 8 XXX
++ SG_ NEW_SIGNAL_1 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 357 NEW_MSG_17: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|32@0+ (1,0) [0|4294967295] "" XXX
++ SG_ NEW_SIGNAL_3 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 358 CAM_End: 8 XXX
++ SG_ NEW_SIGNAL_4 : 11|14@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 59|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 512 NEW_MSG_32: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 514 ENGINE_DATA: 8 XXX
++ SG_ RPM : 7|14@0+ (1,0) [0|8191] "" XXX
++ SG_ NEW_SIGNAL_1 : 19|12@0+ (1,0) [0|255] "" XXX
++ SG_ PEDAL_GAS : 39|10@0+ (1,0) [0|65535] "" XXX
++ SG_ ENGINE_ON : 52|1@0+ (1,0) [0|1] "" XXX
++ SG_ CHKSUM : 56|8@1+ (1,0) [0|255] "" XXX
++
++BO_ 515 NEW_MSG_36: 8 XXX
++ SG_ NEW_SIGNAL_1 : 31|5@0+ (1,0) [0|31] "" XXX
++
++BO_ 529 NEW_MSG_31: 8 XXX
++ SG_ NEW_SIGNAL_3 : 8|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 24|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 39|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 47|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 533 WHEEL_SPEEDS: 8 XXX
++ SG_ FL : 7|16@0+ (0.01,-100) [0|65535] "" XXX
++ SG_ FR : 23|16@0+ (0.01,-100) [0|65535] "" XXX
++ SG_ RL : 39|16@0+ (0.01,-100) [0|65535] "" XXX
++ SG_ RR : 55|16@0+ (0.01,-100) [0|65535] "" XXX
++
++BO_ 535 SPEED: 8 XXX
++ SG_ SPEED : 39|16@0+ (0.01,0) [0|65535] "" XXX
++
++BO_ 537 MANUAL_GEAR: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ GEAR : 33|2@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 544 ACC: 8 XXX
++ SG_ NEW_SIGNAL_2 : 1|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_11 : 2|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_6 : 3|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 7|4@0+ (1,0) [0|15] "" XXX
++ SG_ ACCEL_CMD : 16|12@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_12 : 17|1@0+ (1,0) [0|1] "" XXX
++ SG_ ACC_ENABLED : 18|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_10 : 32|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 33|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 34|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_9 : 35|1@0+ (1,0) [0|1] "" XXX
++ SG_ ACC_ENABLED_2 : 36|1@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_13 : 40|2@1+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_8 : 45|4@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_7 : 46|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 47|1@0+ (1,0) [0|1] "" XXX
++ SG_ HOLD : 49|1@0+ (1,0) [0|255] "" XXX
++ SG_ RESUME : 54|1@0+ (1,0) [0|1] "" XXX
++ SG_ CHECKSUM : 56|8@1+ (1,0) [0|15] "" XXX
++
++BO_ 546 ACC_2: 8 XXX
++ SG_ ACCEL_CMD : 0|12@0+ (1,0) [0|65535] "" XXX
++ SG_ ACC_NOT_ENABLED : 1|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 2|1@0+ (1,0) [0|1] "" XXX
++ SG_ CTR : 7|4@0+ (1,0) [0|15] "" XXX
++ SG_ ACC_ENABLED : 18|1@0+ (1,0) [0|255] "" XXX
++ SG_ BRAKE_RELATED : 20|1@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 31|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 47|16@0+ (1,0) [0|65535] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|15] "" XXX
++
++BO_ 552 GEAR: 8 XXX
++ SG_ NEW_SIGNAL_1 : 0|1@0+ (1,0) [0|1] "" XXX
++ SG_ SHIFT : 8|1@0+ (1,0) [0|1] "" XXX
++ SG_ TORQUE_CONVERTER_LOCK : 11|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 16|1@0+ (1,0) [0|1] "" XXX
++ SG_ GEAR : 33|4@1+ (1,0) [0|255] "" XXX
++ SG_ GEAR_SHIFT : 43|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 56|6@1+ (1,0) [0|63] "" XXX
++
++BO_ 576 STEER_TORQUE: 8 XXX
++ SG_ STEER_TORQUE_SENSOR : 7|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 585 EPS_LKAS: 8 XXX
++ SG_ LKAS_REQUEST : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ STEER_FEEL : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 48|8@1+ (1,0) [0|255] "" XXX
++ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" XXX
++
++BO_ 587 TI_FEEDBACK: 8 XXX
++ SG_ STEER_TORQUE_SENSOR : 7|16@0- (1,0) [0|65535] "" XXX
++ SG_ CPU_0_VIOL : 23|8@0+ (1,0) [0|15] "" XXX
++ SG_ CPU_1_VIOL : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ CPU_2_VIOL : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ CPU_3_VIOL : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ CPU_1_STATE : 48|4@1+ (1,0) [0|15] "" XXX
++ SG_ CPU_0_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ CPU_3_STATE : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CPU_2_STATE : 63|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 608 NEW_MSG_41: 8 XXX
++ SG_ NEW_SIGNAL_1 : 8|7@1+ (1,0) [0|15] "" XXX
++
++BO_ 1034 KEEP_ALIVE_2: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 55|16@0+ (1,0) [0|255] "" XXX
++
++BO_ 1067 NEW_MSG_33: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 23|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 42|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 43|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_6 : 44|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 45|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_7 : 47|8@0+ (1,0) [0|3] "" XXX
++
++BO_ 1078 NEW_MSG_44: 8 XXX
++ SG_ IGNITION : 10|1@1+ (1,0) [0|255] "" XXX
++
++BO_ 1086 NEW_MSG_43E: 8 XXX
++ SG_ NEW_SIGNAL_1 : 39|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 1087 BRAKE_PEDAL_SLOW: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 32|1@0+ (1,0) [0|1] "" XXX
++ SG_ BRAKE_PEDAL_PRESSED : 42|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 47|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 1098 CRUZE_STATE: 8 XXX
++ SG_ NEW_SIGNAL_7 : 1|1@0+ (1,0) [0|1] "" XXX
++ SG_ CRZ_STATE : 6|3@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 13|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 18|1@0+ (1,0) [0|1] "" XXX
++ SG_ CRZ_SPEED : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ DISTANCE_SETTING : 39|3@0+ (1,0) [0|4] "" XXX
++ SG_ NEW_SIGNAL_5 : 42|1@0+ (1,0) [0|1] "" XXX
++ SG_ STOCK_LKAS_MODE : 44|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 45|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 1103 NEW_MSG_42: 8 XXX
++ SG_ NEW_SIGNAL_1 : 12|12@0+ (1,0) [0|4095] "" XXX
++
++BO_ 1120 CAM_KEEP_ALIVE_2: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 1167 SYSTEM_SETTINGS: 8 XXX
++ SG_ IMPERIAL_UNIT : 15|1@0- (1,0) [0|1] "" XXX
++
++BO_ 1200 KEEP_ALIVE_3: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 55|16@0+ (1,0) [0|255] "" XXX
++
++BO_ 1209 KEEP_ALIVE_1: 8 XXX
++ SG_ NEW_SIGNAL_8 : 4|5@0+ (1,0) [0|127] "" XXX
++ SG_ NEW_SIGNAL_7 : 15|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 23|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 55|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 1216 CAM_69: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_5 : 55|12@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_1 : 56|4@1+ (1,0) [0|15] "" XXX
++
++BO_ 1436 CAM_71: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 1866 NEW_MSG_37: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 15|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_7 : 55|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_8 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 1867 TI_FEEDBACK2: 8 XXX
++ SG_ HALL2 : 7|16@0- (-1,0) [0|65535] "" XXX
++ SG_ HALL3 : 23|16@0- (-1,0) [0|65535] "" XXX
++ SG_ HALL4 : 39|16@0- (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_5 : 55|8@0+ (1,0) [0|255] "" XXX
++ SG_ CTR : 63|8@0+ (1,0) [0|65535] "" XXX
++
++BO_ 1868 TI_FEEDBACK3: 8 XXX
++ SG_ OUT1 : 7|16@0+ (1,-32767) [0|65535] "" XXX
++ SG_ OUT2 : 23|16@0- (1,0) [0|65535] "" XXX
++ SG_ OUT3 : 39|16@0- (-1,0) [0|65535] "" XXX
++ SG_ OUT4 : 55|16@0- (-1,0) [0|65535] "" XXX
++
++CM_ SG_ 31 GEAR "13-P, 12-R, 11-N, 1-6-D";
++VAL_ 31 GEAR 13 "P" 12 "R" 11 "N" 1 "D" 2 "D" 3 "D" 4 "D" 5 "D" 6 "D";
++VAL_ 133 LKAS_REQUEST -430 "DISABLED";
++VAL_ 537 GEAR 0 "P" 1 "D" 2 "R";
++VAL_ 552 GEAR 13 "P" 12 "R" 11 "N" 1 "D" 2 "D" 3 "D" 4 "D" 5 "D" 6 "D";
++VAL_ 552 GEAR_SHIFT 6 "6th" 5 "5th" 4 "4th" 3 "3rd" 2 "2nd" 1 "1st" 14 "Shift" 13 "Park" 11 "Neutral" 12 "Reverse";
++VAL_ 1098 CRZ_STATE 0 "CRUISE_DISABLED" 1 "CRUISE_READY" 2 "CRUISE_ENABLED" 4 "GAS_OVERRIDE";
++VAL_ 1098 DISTANCE_SETTING 4 "CLOSE" 3 "MEDIUM_CLOSE" 2 "MEDIUM_FAR" 1 "FAR" 0 "ACC_DISABLED";
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/dbc/mazda_2023.dbc b/opendbc_repo/opendbc/dbc/mazda_2023.dbc
+new file mode 100644
+index 0000000..ae32770
+--- /dev/null
++++ b/opendbc_repo/opendbc/dbc/mazda_2023.dbc
+@@ -0,0 +1,660 @@
++VERSION ""
++
++
++NS_ :
++    NS_DESC_
++    CM_
++    BA_DEF_
++    BA_
++    VAL_
++    CAT_DEF_
++    CAT_
++    FILTER
++    BA_DEF_DEF_
++    EV_DATA_
++    ENVVAR_DATA_
++    SGTYPE_
++    SGTYPE_VAL_
++    BA_DEF_SGTYPE_
++    BA_SGTYPE_
++    SIG_TYPE_REF_
++    VAL_TABLE_
++    SIG_GROUP_
++    SIG_VALTYPE_
++    SIGTYPE_VALTYPE_
++    BO_TX_BU_
++    BA_DEF_REL_
++    BA_REL_
++    BA_DEF_DEF_REL_
++    BU_SG_REL_
++    BU_EV_REL_
++    BU_BO_REL_
++    SG_MUL_VAL_
++
++BS_:
++
++BU_: XXX
++
++BO_ 16 STEER_TORQUE_VB: 8 XXX
++ SG_ STEER_TORQUE_SENSOR : 5|13@0+ (1,-4000) [0|15] "" XXX
++ SG_ NEW_SIGNAL_12 : 7|2@0+ (1,0) [0|15] "" XXX
++ SG_ STEER_TORQUE_MOTOR : 8|13@0+ (0.05,-205) [0|15] "" XXX
++ SG_ BRAKE_PREASURE : 27|12@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 43|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_5 : 47|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0- (1,0) [0|15] "" XXX
++
++BO_ 17 STEER_TORQUE_VB_2: 8 XXX
++ SG_ STEER_TORQUE_MOTOR : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 27|14@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 45|6@0+ (1,0) [0|15] "" XXX
++ SG_ CTR : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_5 : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 18 STEER_VB: 8 XXX
++ SG_ STEER_ANGLE : 25|14@0- (1,375) [0|65536] "" XXX
++ SG_ STEER_LEFT_BIT : 26|1@0+ (1,0) [0|1] "" XXX
++ SG_ CTR : 41|2@0+ (1,0) [0|3] "" XXX
++ SG_ ENGINE_OFF : 43|2@0+ (1,0) [0|63] "" XXX
++ SG_ NEW_SIGNAL_2 : 53|6@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 55|2@0+ (1,0) [0|15] "" XXX
++
++BO_ 20 NEW_MSG_29: 8 XXX
++ SG_ RIGHT_BLINK_CLOCK : 23|8@0+ (1,0) [0|1] "" XXX
++
++BO_ 22 CRZ_CTRL_BTNS: 8 XXX
++ SG_ SIGNAL : 45|1@0+ (1,0) [0|15] "" XXX
++ SG_ NOT_SIGNAL : 46|1@0+ (1,0) [0|3] "" XXX
++ SG_ CRZ_CTRL_BTN_PRESSED : 48|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 51|3@0+ (1,0) [0|7] "" XXX
++
++BO_ 24 BRAKE_PEDAL_VB: 8 XXX
++ SG_ BRAKE_PEDAL_PRESSED_AND_ENGINE_ON : 0|1@0+ (1,0) [0|3] "" XXX
++ SG_ NOT_BRAKE_PEDAL_PRESSED : 6|1@0+ (1,0) [0|3] "" XXX
++ SG_ BRAKE_PRESSED : 7|1@0+ (1,0) [0|65535] "" XXX
++ SG_ NOT_BRAKE_PEDAL_PRESSED_AND_ENGINE_ON : 15|1@0+ (1,0) [0|7] "" XXX
++
++BO_ 26 ENGINE_DATA_VB: 8 XXX
++ SG_ RPM : 7|13@0+ (1,0) [0|15] "" XXX
++ SG_ PEDAL_GAS : 39|10@0+ (1,0) [0|15] "" XXX
++ SG_ ENGINE_ON : 52|1@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0- (1,0) [0|15] "" XXX
++
++BO_ 29 WHEEL: 8 XXX
++ SG_ ENCODER_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ ENCODER_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ SPEED : 39|16@0+ (1,0) [0|127] "" XXX
++ SG_ NEW_SIGNAL_2 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STANDSTILL : 52|1@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_6 : 55|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_1 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 31 GEAR_VB: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ GEAR : 36|4@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 37 BLANK_1: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 44 BLANK_2: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|16777215] "" XXX
++ SG_ NEW_SIGNAL_4 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 39|16@0+ (1,0) [0|16777215] "" XXX
++ SG_ NEW_SIGNAL_3 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 59 STEER_RATE: 8 XXX
++ SG_ STEER_ANGLE : 23|16@0+ (0.05,-1600) [-500|500] "" XXX
++ SG_ CHKSUM : 39|8@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 43|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 47|4@0+ (1,0) [0|15] "" XXX
++ SG_ STEER_ANGLE_RATE : 55|8@0+ (0.05,0) [0|65535] "" XXX
++
++BO_ 96 STEER2: 8 XXX
++ SG_ STEER__ : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ SPEED : 18|16@0- (0.00621371,-62.1371) [-65635|65635] "MPH" XXX
++ SG_ CAR_MOVING_FORWARD : 21|1@0+ (1,0) [0|15] "" XXX
++ SG_ CAR_REVERSING : 22|1@0+ (1,0) [0|1] "" XXX
++ SG_ ENGINE_OFF : 23|1@0+ (1,0) [0|1] "" XXX
++ SG_ TURN_OFF : 32|1@0+ (1,0) [0|1] "" XXX
++ SG_ ENGINE_ON : 33|1@0+ (1,0) [0|1] "" XXX
++ SG_ TURN_ON : 34|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 45|1@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_5 : 48|4@1+ (1,0) [0|15] "" XXX
++ SG_ CTR : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 116 BRAKE_2: 8 XXX
++ SG_ BRAKE_PRESSURE : 3|9@0+ (1,-152) [0|511] "" XXX
++
++BO_ 117 NEW_MSG_31_MAIN: 8 XXX
++
++BO_ 120 BCM_ECHO_MAYBE: 8 XXX
++ SG_ EPS_MOTOR_TORQUE_MAYBE : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ BRAKE_MAYBE : 39|8@0+ (1,0) [0|65535] "" XXX
++
++BO_ 121 NEW_MSG_39: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 16|2@1+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|10@0+ (1,0) [0|3] "" XXX
++
++BO_ 128 RADARS: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 15|1@0+ (1,0) [0|255] "" XXX
++ SG_ REAR_LEFT : 17|1@0+ (1,0) [0|1] "" XXX
++ SG_ FRONT_RIGHT : 18|1@0+ (1,0) [0|1] "" XXX
++ SG_ FRONT_LEFT : 19|1@0+ (1,0) [0|255] "" XXX
++ SG_ REAR_RIGHT : 20|1@0+ (1,0) [0|15] "" XXX
++ SG_ FRONT : 21|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 59|4@0+ (1,0) [0|255] "" XXX
++
++BO_ 129 NEW_MSG_19: 8 XXX
++ SG_ NEW_SIGNAL_2 : 15|1@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 31|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 47|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_5 : 56|8@1+ (1,0) [0|15] "" XXX
++
++BO_ 130 STEER_AUX: 8 XXX
++ SG_ STEER_ANGLE : 23|14@0+ (0.2,-1600) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 55|16@0- (1,0) [0|65535] "" XXX
++
++BO_ 132 NEW_MSG_84: 8 XXX
++ SG_ STEER_ANGLE : 23|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 133 NEW_MSG_35: 8 XXX
++ SG_ STEER_ANGLE : 23|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 134 STEER_OLD: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ STEER_ANGLE : 25|14@0- (0.1,36) [0|1023] "" XXX
++
++BO_ 135 STEER: 8 XXX
++ SG_ STEER_ANGLE : 23|16@0+ (0.1,-1600) [0|65535] "" XXX
++
++BO_ 136 NEW_MSG_40: 8 XXX
++ SG_ NEW_SIGNAL_4 : 4|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 5|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_6 : 6|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 36|13@0+ (1,0) [0|8191] "" XXX
++ SG_ NEW_SIGNAL_2 : 59|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 60|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 137 SPEED: 8 XXX
++ SG_ SPEED : 23|16@0+ (1,-12) [0|65535] "" XXX
++
++BO_ 145 BLINK_INFO: 8 XXX
++ SG_ RIGHT_BLINK : 12|1@0+ (1,0) [0|3] "" XXX
++ SG_ LEFT_BLINK : 13|1@0+ (1,0) [0|3] "" XXX
++ SG_ Speed : 27|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 40|8@1+ (1,0) [0|255] "" XXX
++ SG_ CTR : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|15] "" XXX
++
++BO_ 151 NEW_MSG_97: 8 XXX
++
++BO_ 155 NEW_MSG_43: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|16777215] "" XXX
++ SG_ NEW_SIGNAL_2 : 15|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 157 CRZ_BTNS: 8 XXX
++ SG_ RES : 2|1@0+ (1,0) [0|1] "" XXX
++ SG_ SET_M : 3|1@0+ (1,0) [0|1] "" XXX
++ SG_ SET_P : 4|1@0+ (1,0) [0|1] "" XXX
++ SG_ CAN : 5|1@0+ (1,0) [0|1] "" XXX
++ SG_ STATIC_0 : 7|2@0+ (1,0) [0|7] "" XXX
++ SG_ STATIC_1 : 10|7@0+ (1,0) [0|15] "" XXX
++ SG_ MODE_LKAS : 11|1@0+ (1,0) [0|1] "" XXX
++ SG_ MODE_ACC : 13|1@0+ (1,0) [0|3] "" XXX
++ SG_ STATIC_2 : 19|32@0+ (1,0) [0|7] "" XXX
++ SG_ CTR : 48|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 56|8@1+ (1,0) [0|63] "" XXX
++
++BO_ 159 BRAKE_PEDAL: 8 XXX
++ SG_ REVERSE : 1|1@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_1 : 2|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 4|1@1+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 40|6@1+ (1,0) [0|15] "" XXX
++ SG_ BRAKE_NOT_PRESSED : 58|1@0+ (1,0) [0|1] "" XXX
++ SG_ BRAKE_PRESSED : 59|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 253 NEW_MSG_34: 8 XXX
++ SG_ NEW_SIGNAL_1 : 36|5@0+ (1,0) [0|31] "" XXX
++
++BO_ 256 CAM_Start: 8 XXX
++ SG_ DISTANCE_LEAD_CAR : 0|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 2|2@0+ (1,0) [0|1] "" XXX
++ SG_ ACTIVE_TARGET : 4|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 20|12@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_5 : 24|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_10 : 44|12@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_7 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_8 : 61|2@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 63|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 257 LKAS: 8 XXX
++ SG_ LEAD_DIST : 0|12@0+ (1,0) [0|255] "" XXX
++ SG_ SET_19 : 2|2@0+ (1,0) [0|255] "" XXX
++ SG_ ANGLE_TARGET : 20|12@0+ (1,0) [0|4095] "" XXX
++ SG_ UNKNOWN : 24|12@0+ (1,0) [0|4095] "" XXX
++ SG_ MAX_TORQUE__ : 44|12@0- (1,0) [0|4095] "" XXX
++ SG_ SET_0 : 48|1@1+ (1,0) [0|3] "" XXX
++ SG_ CTR : 59|4@0+ (1,0) [0|255] "" XXX
++ SG_ CTR_ACT : 61|2@0+ (1,0) [0|3] "" XXX
++ SG_ SET_0_1 : 63|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 258 NEW_MSG_3: 8 XXX
++ SG_ NEW_SIGNAL_6 : 1|2@1+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_1 : 13|10@0- (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 18|10@0- (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|10@0- (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 44|10@0- (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 59|4@0+ (1,0) [0|255] "" XXX
++
++BO_ 259 NEW_MSG_5: 8 XXX
++ SG_ NEW_SIGNAL_1 : 0|12@0- (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 19|11@0- (1,0) [0|10000000] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|10@0- (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 44|10@0- (1,0) [0|1] "" XXX
++
++BO_ 260 NEW_MSG_6: 8 XXX
++ SG_ NEW_SIGNAL_1 : 0|12@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 20|12@0- (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 24|12@0+ (1,0) [0|1] "" XXX
++
++BO_ 261 NEW_MSG_7: 8 XXX
++ SG_ NEW_SIGNAL_1 : 15|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 262 NEW_MSG_8: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 15|8@0- (1,0) [0|255] "" XXX
++
++BO_ 263 NEW_MSG_9: 8 XXX
++ SG_ NEW_SIGNAL_1 : 15|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 264 NEW_MSG_2: 8 XXX
++ SG_ CRZ_CTRL_PRESSED : 48|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 49|3@1+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_1 : 56|8@1+ (1,0) [0|15] "" XXX
++
++BO_ 273 NEW_MSG_26: 8 XXX
++ SG_ NEW_SIGNAL_1 : 23|4@0+ (1,0) [0|3] "" XXX
++
++BO_ 274 NEW_MSG_27: 8 XXX
++ SG_ NEW_SIGNAL_1 : 39|8@0+ (1,0) [0|1] "" XXX
++
++BO_ 277 NEW_MSG_24: 8 XXX
++ SG_ NEW_SIGNAL_1 : 47|8@0+ (1,0) [0|1] "" XXX
++
++BO_ 278 NEW_MSG_25: 8 XXX
++
++BO_ 288 NEW_MSG_30: 8 XXX
++
++BO_ 289 NEW_MSG_28: 8 XXX
++ SG_ NEW_SIGNAL_1 : 55|8@0+ (1,0) [0|1] "" XXX
++
++BO_ 290 NEW_MSG_23: 8 XXX
++ SG_ NEW_SIGNAL_1 : 31|5@0+ (1,0) [0|255] "" XXX
++
++BO_ 291 NEW_MSG_22: 8 XXX
++ SG_ NEW_SIGNAL_1 : 39|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 292 NEW_MSG_18: 8 XXX
++ SG_ NEW_SIGNAL_1 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 293 NEW_MSG_12: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 19|4@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 39|16@0+ (1,0) [0|255] "" XXX
++
++BO_ 294 NEW_MSG_13: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|16@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 59|4@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 61|2@0+ (1,0) [0|1] "" XXX
++
++BO_ 304 CAM_LANES: 8 XXX
++ SG_ DISTANCE_TO_LEFT_LANE : 1|10@0- (1,0) [0|1] "" XXX
++ SG_ RIGHT_LANE_DETECTED : 4|1@0+ (1,0) [0|255] "" XXX
++ SG_ LEFT_LANE_DETECTED : 7|1@0+ (1,0) [0|1] "" XXX
++ SG_ DISTANCE_TO_RIGHT_LANE : 23|10@0- (1,0) [0|2047] "" XXX
++ SG_ DISTANCE_TO_LEFT_LANE_LOW_RES : 29|8@0+ (1,0) [0|4095] "" XXX
++ SG_ DISTANCE_TO_RIGHT_LANE_LOW_RES : 37|8@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 59|4@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 305 CAM_LANES_2_MAYBE: 8 XXX
++ SG_ NEW_SIGNAL_4 : 23|8@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_6 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 306 CAM_LANE_3_MAYBE: 8 XXX
++ SG_ STEER : 7|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 13|10@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 19|10@0+ (1,0) [0|63] "" XXX
++ SG_ NEW_SIGNAL_4 : 25|10@0+ (1,0) [0|1] "" XXX
++ SG_ LANE_DETECTED_1 : 44|1@0+ (1,0) [0|1] "" XXX
++ SG_ LANE_DETECTED_2 : 45|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 307 NEW_MSG_1: 8 XXX
++ SG_ NEW_SIGNAL_4 : 7|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 13|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 19|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 25|10@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 61|6@0+ (1,0) [0|1] "" XXX
++
++BO_ 308 ACC_POSSIBLY: 8 XXX
++ SG_ NEW_SIGNAL_2 : 0|7@0+ (1,0) [0|63] "" XXX
++ SG_ NEW_SIGNAL_6 : 4|1@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 18|7@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_5 : 36|7@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_7 : 37|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 54|7@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_8 : 55|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 310 NEW_MSG_10: 8 XXX
++ SG_ NEW_SIGNAL_2 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 56|4@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 320 NEW_MSG_4: 8 XXX
++ SG_ NEW_SIGNAL_4 : 16|1@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 27|7@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 36|9@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 43|6@0+ (1,0) [0|1] "" XXX
++
++BO_ 321 NEW_MSG_11: 8 XXX
++ SG_ NEW_SIGNAL_1 : 5|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 32|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 336 NEW_MSG_20: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|8@0+ (1,0) [0|4095] "" XXX
++ SG_ NEW_SIGNAL_1 : 11|12@0+ (1,0) [0|127] "" XXX
++ SG_ NEW_SIGNAL_3 : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 47|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 342 NEW_MSG_21: 8 XXX
++ SG_ NEW_SIGNAL_7 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_8 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_5 : 39|16@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_6 : 40|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 48|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 63|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 352 NEW_MSG_14: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 354 CAM_KEEP_ALIVE_1: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|30@0+ (1,0) [0|65535] "" XXX
++
++BO_ 355 NEW_MSG_15: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|127] "" XXX
++
++BO_ 356 NEW_MSG_16: 8 XXX
++ SG_ NEW_SIGNAL_1 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 357 NEW_MSG_17: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|32@0+ (1,0) [0|4294967295] "" XXX
++ SG_ NEW_SIGNAL_3 : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 358 CAM_End: 8 XXX
++ SG_ NEW_SIGNAL_4 : 11|14@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 59|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 61|2@0+ (1,0) [0|3] "" XXX
++
++BO_ 512 NEW_MSG_32: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 514 ENGINE_DATA: 8 XXX
++ SG_ RPM : 7|14@0+ (1,0) [0|8191] "" XXX
++ SG_ NEW_SIGNAL_1 : 19|12@0+ (1,0) [0|255] "" XXX
++ SG_ PEDAL_GAS : 39|10@0+ (1,0) [0|65535] "" XXX
++ SG_ ENGINE_ON : 52|1@0+ (1,0) [0|1] "" XXX
++ SG_ CHKSUM : 56|8@1+ (1,0) [0|255] "" XXX
++
++BO_ 515 NEW_MSG_36: 8 XXX
++ SG_ NEW_SIGNAL_1 : 31|5@0+ (1,0) [0|31] "" XXX
++
++BO_ 529 NEW_MSG_31: 8 XXX
++ SG_ NEW_SIGNAL_3 : 8|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 24|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 39|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_2 : 47|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 533 WHEEL_SPEEDS: 8 XXX
++ SG_ FL : 7|16@0+ (0.01,-100) [0|65535] "" XXX
++ SG_ FR : 23|16@0+ (0.01,-100) [0|65535] "" XXX
++ SG_ RL : 39|16@0+ (0.01,-100) [0|65535] "" XXX
++ SG_ RR : 55|16@0+ (0.01,-100) [0|65535] "" XXX
++
++BO_ 535 SPEED_OLD: 8 XXX
++ SG_ SPEED : 39|16@0+ (0.01,0) [0|65535] "" XXX
++
++BO_ 537 MANUAL_GEAR: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ GEAR : 33|2@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 542 ACC: 8 XXX
++ SG_ CTR1 : 3|4@0+ (1,0) [0|31] "" XXX
++ SG_ DERIVATIVE : 7|4@0+ (1,0) [0|1] "" XXX
++ SG_ CTR2 : 11|4@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 12|1@0+ (1,0) [0|1] "" XXX
++ SG_ ACC_ACTIVE : 13|1@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_4 : 15|2@0+ (1,0) [0|3] "" XXX
++ SG_ ACCEL_CMD : 23|12@0+ (1,-2000) [0|8191] "" XXX
++ SG_ ACC_ACTIVE2 : 27|1@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_1 : 35|4@0+ (1,0) [0|15] "" XXX
++ SG_ CTR3 : 37|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_6 : 39|2@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_7 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_9 : 48|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_11 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 543 NEW_MSG_21F: 8 XXX
++ SG_ NEW_SIGNAL_1 : 22|7@0+ (1,0) [0|127] "" XXX
++ SG_ NEW_SIGNAL_2 : 31|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 546 ACC_2: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 11|4@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 17|2@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_7 : 19|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_6 : 23|4@0+ (1,0) [0|63] "" XXX
++ SG_ NEW_SIGNAL_2 : 31|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 47|16@0+ (1,0) [0|65535] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|15] "" XXX
++
++BO_ 547 NEW_MSG_223: 8 XXX
++
++BO_ 552 GEAR: 8 XXX
++ SG_ NEW_SIGNAL_1 : 0|1@0+ (1,0) [0|1] "" XXX
++ SG_ SHIFT : 8|1@0+ (1,0) [0|1] "" XXX
++ SG_ TORQUE_CONVERTER_LOCK : 11|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 16|1@0+ (1,0) [0|1] "" XXX
++ SG_ GEAR : 33|4@1+ (1,0) [0|255] "" XXX
++ SG_ GEAR_SHIFT : 43|4@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_3 : 56|6@1+ (1,0) [0|63] "" XXX
++
++BO_ 576 STEER_TORQUE: 8 XXX
++ SG_ STEER_TORQUE_SENSOR : 7|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 585 EPS_LKAS: 8 XXX
++ SG_ LKAS_REQUEST : 7|16@0- (1,0) [0|65535] "" XXX
++ SG_ STEER_FEEL : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 48|8@1+ (1,0) [0|255] "" XXX
++ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" XXX
++
++BO_ 587 TI_FEEDBACK: 8 XXX
++ SG_ STEER_TORQUE_SENSOR : 7|16@0- (1,0) [0|65535] "" XXX
++ SG_ CPU_0_VIOL : 23|8@0+ (1,0) [0|15] "" XXX
++ SG_ CPU_1_VIOL : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ CPU_2_VIOL : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ CPU_3_VIOL : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ CPU_1_STATE : 48|4@1+ (1,0) [0|15] "" XXX
++ SG_ CPU_0_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ CPU_3_STATE : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CPU_2_STATE : 63|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 608 NEW_MSG_41: 8 XXX
++ SG_ NEW_SIGNAL_1 : 8|7@1+ (1,0) [0|15] "" XXX
++
++BO_ 640 NEW_MSG_280: 8 XXX
++ SG_ NEW_SIGNAL_1 : 2|3@0+ (1,0) [0|7] "" XXX
++
++BO_ 1029 NEW_MSG_405: 8 XXX
++ SG_ LEFT_TURN_SIGNAL_PULSE : 48|1@0+ (1,0) [0|1] "" XXX
++ SG_ RIGHT_TURN_SIGNAL_PULSE : 49|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 1034 KEEP_ALIVE_2: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 55|16@0+ (1,0) [0|255] "" XXX
++
++BO_ 1045 NEW_MSG_415: 8 XXX
++ SG_ AUTO_HOLD_ACTIVE : 4|1@0+ (1,0) [0|1] "" XXX
++ SG_ AUTO_HOLD_ENABLED : 22|1@0+ (1,0) [0|3] "" XXX
++ SG_ PARKING_BRAKE_ACTIVE : 37|1@0+ (1,0) [0|1] "" XXX
++ SG_ CTR : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ CHKSUM : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 1066 NEW_MSG_42A: 8 XXX
++
++BO_ 1067 NEW_MSG_33: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 23|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 42|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 43|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_6 : 44|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 45|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_7 : 47|8@0+ (1,0) [0|3] "" XXX
++
++BO_ 1078 NEW_MSG_44: 8 XXX
++ SG_ IGNITION : 10|1@1+ (1,0) [0|255] "" XXX
++
++BO_ 1087 BRAKE_PEDAL_BUS1: 8 XXX
++ SG_ NEW_SIGNAL_3 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ LEFT_TURN_SIGNAL_PULSE : 32|1@0+ (1,0) [0|1] "" XXX
++ SG_ RIGHT_TURN_SIGNAL_PULSE : 34|1@0+ (1,0) [0|1] "" XXX
++ SG_ BRAKE_PEDAL_PRESSED : 42|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_5 : 47|4@0+ (1,0) [0|15] "" XXX
++
++BO_ 1098 CRUZE_STATE: 8 XXX
++ SG_ NEW_SIGNAL_7 : 1|1@0+ (1,0) [0|1] "" XXX
++ SG_ CRZ_STATE : 6|3@0+ (1,0) [0|15] "" XXX
++ SG_ NEW_SIGNAL_1 : 13|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 18|1@0+ (1,0) [0|1] "" XXX
++ SG_ CRZ_SPEED : 31|9@0+ (1,0) [0|255] "" XXX
++ SG_ DISTANCE_SETTING : 38|3@0+ (1,0) [0|4] "" XXX
++ SG_ NEW_SIGNAL_5 : 42|1@0+ (1,0) [0|1] "" XXX
++ SG_ STOCK_LKAS_MODE : 44|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 45|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 1100 NEW_MSG_44C: 8 XXX
++ SG_ TRAFFIC_SIGN_SYSTEM_ENABLED_1 : 4|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_1 : 5|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_4 : 8|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_3 : 10|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEW_SIGNAL_2 : 37|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 1103 NEW_MSG_42: 8 XXX
++ SG_ NEW_SIGNAL_1 : 12|12@0+ (1,0) [0|4095] "" XXX
++
++BO_ 1120 CAM_KEEP_ALIVE_2: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 1167 SYSTEM_SETTINGS: 8 XXX
++ SG_ IMPERIAL_UNIT : 15|1@0+ (1,0) [0|1] "" XXX
++
++BO_ 1170 NEW_MSG_492: 8 XXX
++ SG_ MRCC_NOT_ALLOWED : 12|1@0+ (1,0) [0|1] "" XXX
++ SG_ MRRC_ALLOWED : 13|1@0+ (1,0) [0|3] "" XXX
++
++BO_ 1200 KEEP_ALIVE_3: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_2 : 55|16@0+ (1,0) [0|255] "" XXX
++
++BO_ 1209 KEEP_ALIVE_1: 8 XXX
++ SG_ NEW_SIGNAL_8 : 4|5@0+ (1,0) [0|127] "" XXX
++ SG_ NEW_SIGNAL_7 : 15|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 23|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 55|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 1216 CAM_69: 8 XXX
++ SG_ NEW_SIGNAL_2 : 7|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_5 : 55|12@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_1 : 56|4@1+ (1,0) [0|15] "" XXX
++
++BO_ 1436 CAM_71: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|16@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 23|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_3 : 39|16@0+ (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_4 : 55|16@0+ (1,0) [0|65535] "" XXX
++
++BO_ 1866 NEW_MSG_37: 8 XXX
++ SG_ NEW_SIGNAL_1 : 7|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_2 : 15|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_3 : 23|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_4 : 31|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_5 : 39|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_7 : 55|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_8 : 63|8@0+ (1,0) [0|255] "" XXX
++
++BO_ 1867 EPS_FEEDBACK2: 8 XXX
++ SG_ HALL2 : 7|16@0- (-1,0) [0|65535] "" XXX
++ SG_ HALL3 : 23|16@0- (-1,0) [0|65535] "" XXX
++ SG_ HALL4 : 39|16@0- (1,0) [0|65535] "" XXX
++ SG_ NEW_SIGNAL_5 : 55|8@0+ (1,0) [0|255] "" XXX
++ SG_ CTR : 63|8@0+ (1,0) [0|65535] "" XXX
++
++BO_ 1868 EPS_FEEDBACK3: 8 XXX
++ SG_ OUT1 : 7|16@0- (1,-32767) [0|65535] "" XXX
++ SG_ OUT2 : 23|16@0- (1,0) [0|65535] "" XXX
++ SG_ OUT3 : 39|16@0- (-1,0) [0|65535] "" XXX
++ SG_ OUT4 : 55|16@0- (-1,0) [0|65535] "" XXX
++
++CM_ SG_ 31 GEAR "13-P, 12-R, 11-N, 1-6-D";
++VAL_ 31 GEAR 13 "P" 12 "R" 11 "N" 1 "D" 2 "D" 3 "D" 4 "D" 5 "D" 6 "D";
++VAL_ 537 GEAR 0 "P" 1 "D" 2 "R";
++VAL_ 552 GEAR 13 "P" 12 "R" 11 "N" 1 "D" 2 "D" 3 "D" 4 "D" 5 "D" 6 "D";
++VAL_ 552 GEAR_SHIFT 6 "6th" 5 "5th" 4 "4th" 3 "3rd" 2 "2nd" 1 "1st" 14 "Shift" 13 "Park" 11 "Neutral" 12 "Reverse";
++VAL_ 1098 CRZ_STATE 1 "CRUISE_DISABLED" 2 "CRUISE_READY" 4 "GAS_OVERRIDE" 3 "CRUISE_ENABLE";
++VAL_ 1098 DISTANCE_SETTING 4 "CLOSE" 3 "MEDIUM_CLOSE" 2 "MEDIUM_FAR" 1 "FAR" 0 "ACC_DISABLED";
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/safety/modes/mazda.h b/opendbc_repo/opendbc/safety/modes/mazda.h
+index a36d75a..33aa2d1 100644
+--- a/opendbc_repo/opendbc/safety/modes/mazda.h
++++ b/opendbc_repo/opendbc/safety/modes/mazda.h
+@@ -3,6 +3,7 @@
+ #include "opendbc/safety/declarations.h"
+ 
+ // CAN msgs we care about
++/********** GEN1 msgs **********/
+ #define MAZDA_LKAS          0x243U
+ #define MAZDA_LKAS_HUD      0x440U
+ #define MAZDA_CRZ_CTRL      0x21cU
+@@ -10,23 +11,118 @@
+ #define MAZDA_STEER_TORQUE  0x240U
+ #define MAZDA_ENGINE_DATA   0x202U
+ #define MAZDA_PEDALS        0x165U
++#define TI_STEER_TORQUE     0x24AU
++// Radar
++#define MAZDA_CRZ_INFO      0x21BU
++#define MAZDA_RADAR_361     0x361U
++#define MAZDA_RADAR_362     0x362U
++#define MAZDA_RADAR_363     0x363U
++#define MAZDA_RADAR_364     0x364U
++#define MAZDA_RADAR_365     0x365U
++#define MAZDA_RADAR_366     0x366U
++#define MAZDA_RADAR_499     0x499U
++/************* GEN2 msgs *************/
++#define MAZDA_2019_BRAKE          0x43FU  // main bus
++#define MAZDA_2019_GAS            0x202U  // camera bus DBC: ENGINE_DATA
++#define MAZDA_2019_CRUISE         0x44AU  // main bus. DBC: CRUISE_STATE
++#define MAZDA_2019_SPEED          0x217U  // camera bus. DBC: SPEED
++#define MAZDA_2019_STEER_TORQUE   0x24BU  // aux bus. DBC: TI_FEEDBACK
++#define MAZDA_2019_CRZ_BTNS       0x9DU   // rx on main tx on camera. DBC: CRZ_BTNS
++#define MAZDA_2019_ACC            0x220U  // main bus. DBC: ACC
++#define MAZDA_TI_LKAS             0x249U
++/************* GEN3 msgs *************/
++#define MAZDA_2023_SPEED          0x215  // main bus. DBC: WHEEL_SPEEDS
++#define MAZDA_2023_BRAKE          0x9F  // main bus. DBC: BRAKE_PEDAL
++#define MAZDA_2023_ACC            0x21e  // main bus. DBC: ACC
+ 
+ // CAN bus numbers
+ #define MAZDA_MAIN 0
++#define MAZDA_AUX  1
+ #define MAZDA_CAM  2
+ 
++// param flag masks
++const int FLAG_GEN1 = 1;
++const int FLAG_GEN2 = 2;
++const int FLAG_GEN3 = 4;
++const int FLAG_TORQUE_INTERCEPTOR = 8;
++const int FLAG_RADAR_INTERCEPTOR = 16;
++const int FLAG_NO_FSC = 32;
++const int FLAG_NO_MRCC = 64;
++
++bool gen1 = false;
++bool gen2 = false;
++bool gen3 = false;
++bool torque_interceptor = false;
++bool radar_interceptor = false;
++bool no_fsc = false;
++bool no_mrcc = false;
++
++
+ // track msgs coming from OP so that we know what CAM msgs to drop and what to forward
+ static void mazda_rx_hook(const CANPacket_t *msg) {
+   if ((int)msg->bus == MAZDA_MAIN) {
+-    if (msg->addr == MAZDA_ENGINE_DATA) {
+-      // sample speed: scale by 0.01 to get kph
+-      int speed = (msg->data[2] << 8) | msg->data[3];
+-      vehicle_moving = speed > 10; // moving when speed > 0.1 kph
++    if (gen1) {
++      if (msg->addr == MAZDA_ENGINE_DATA) {
++        // sample speed: scale by 0.01 to get kph
++        int speed = (msg->data[2] << 8) | msg->data[3];
++        vehicle_moving = speed > 10; // moving when speed > 0.1 kph
++      }
++
++      if (msg->addr == MAZDA_STEER_TORQUE && !torque_interceptor) {
++        int torque_driver_new = msg->data[0] - 127U;
++        // update array of samples
++        update_sample(&torque_driver, torque_driver_new);
++      }
++
++      // enter controls on rising edge of ACC, exit controls on ACC off
++      if (msg->addr == MAZDA_CRZ_CTRL && !no_mrcc && !radar_interceptor) {
++        acc_main_on = GET_BIT(msg, 17U);
++        bool cruise_engaged = msg->data[0] & 0x8U;
++        pcm_cruise_check(cruise_engaged);
++      }
++
++      if (msg->addr == MAZDA_ENGINE_DATA) {
++        gas_pressed = (msg->data[4] || (msg->data[5] & 0xF0U));
++      }
++
++      if (msg->addr == MAZDA_PEDALS) {
++        brake_pressed = (msg->data[0] & 0x10U);
++        if (radar_interceptor || no_mrcc) {
++          // acc_main_on = GET_BIT(to_push, 17U); TODO
++          bool cruise_engaged = msg->data[0] & 0x8U;
++          pcm_cruise_check(cruise_engaged);
++        }
++      }
+     }
+ 
+-    if (msg->addr == MAZDA_STEER_TORQUE) {
+-      int torque_driver_new = msg->data[0] - 127U;
+-      // update array of samples
++    if (gen2) {
++      if (msg->addr == MAZDA_2019_BRAKE) {
++        brake_pressed = (msg->data[5] & 0x4U);
++      }
++
++      if (msg->addr == MAZDA_2019_CRUISE) {
++        acc_main_on = true;
++        bool cruise_engaged = msg->data[0] & 0x20U;
++        bool pre_enable = msg->data[0] & 0x40U;
++        pcm_cruise_check((cruise_engaged || pre_enable));
++      }
++    }
++
++    if (gen3) {
++      if (msg->addr == MAZDA_2023_BRAKE) {
++        brake_pressed = (msg->data[7] & 0x8U);
++      }
++      if (msg->addr == MAZDA_2023_SPEED) {
++        int speed = ( (msg->data[0] << 8) | (msg->data[1]) ) - 10000; // Front Left Wheel Speed
++        vehicle_moving = speed != 0;
++      }
++    }
++  }
++
++  if ((msg->bus == MAZDA_AUX)) {
++
++    if (msg->addr == TI_STEER_TORQUE && gen1 && torque_interceptor) {
++      int torque_driver_new = msg->data[0] - 127;
+       update_sample(&torque_driver, torque_driver_new);
+     }
+ 
+@@ -38,12 +134,37 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
+       acc_main_on = GET_BIT(msg, 17U);
+     }
+ 
+-    if (msg->addr == MAZDA_ENGINE_DATA) {
+-      gas_pressed = (msg->data[4] || (msg->data[5] & 0xF0U));
++    if (msg->addr == MAZDA_2019_STEER_TORQUE && (gen2 || gen3)) {
++      update_sample(&torque_driver, (int16_t)(msg->data[0] << 8 | msg->data[1]));
++    }
++
++    if (msg->addr == MAZDA_2019_CRUISE && gen3) {
++      uint8_t state = msg->data[0] & 0x70U;
++      bool cruise_engaged = (0x30U == state);
++      bool cruise_override = (0x40U == state);
++      //bool cruise_disable = (state == 0x10U);
++      acc_main_on = true;
++      pcm_cruise_check(cruise_engaged || cruise_override);
+     }
++  }
++
++  if ((msg->bus == MAZDA_CAM)) {
++    if (gen2) {
++
++      if (msg->addr == MAZDA_2019_GAS) {
++        gas_pressed = (msg->data[4] || ((msg->data[5] & 0xC0U)));
++      }
+ 
+-    if (msg->addr == MAZDA_PEDALS) {
+-      brake_pressed = (msg->data[0] & 0x10U);
++      if (msg->addr == MAZDA_2019_SPEED) {
++        // sample speed: scale by 0.01 to get kph
++        int speed = (msg->data[4] << 8) | (msg->data[5]);
++        vehicle_moving = (speed > 10);  // moving when speed > 0.1 kph
++      }
++    }
++    if (gen3) {
++      if (msg->addr == MAZDA_2019_GAS) {
++        gas_pressed = (msg->data[4] || (msg->data[5] & 0xC0U));
++      }
+     }
+   }
+ }
+@@ -59,6 +180,16 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
+     .type = TorqueDriverLimited,
+   };
+ 
++  const TorqueSteeringLimits MAZDA_2019_STEERING_LIMITS = {
++    .max_torque = 8000,
++    .max_rate_up = 45,
++    .max_rate_down = 80,
++    .max_rt_delta = 1688,  // (45*100hz*250000/1000000)*1.5
++    .driver_torque_multiplier = 1,
++    .driver_torque_allowance = 1400,
++    .type = TorqueDriverLimited,
++  };
++
+   bool tx = true;
+   // Check if msg is sent on the main BUS
+   if (msg->bus == (unsigned char)MAZDA_MAIN) {
+@@ -81,12 +212,29 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
+       }
+     }
+   }
++  if ((gen2 || gen3) && (msg->bus == MAZDA_AUX) && (msg->addr == MAZDA_TI_LKAS)) {
++    int desired_torque = (int16_t)((msg->data[0] << 8) | msg->data[1]);  // signal is signed
++    if (steer_torque_cmd_checks(desired_torque, -1, MAZDA_2019_STEERING_LIMITS)) {
++      tx = false;
++    }
++  }
+ 
+   return tx;
+ }
+ 
+ static safety_config mazda_init(uint16_t param) {
+   static const CanMsg MAZDA_TX_MSGS[] = {{MAZDA_LKAS, 0, 8, .check_relay = true}, {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false}, {MAZDA_LKAS_HUD, 0, 8, .check_relay = true}};
++  static const CanMsg MAZDA_TI_TX_MSGS[] = {{MAZDA_LKAS, 0, 8, .check_relay = true}, {MAZDA_TI_LKAS, 1, 8, .check_relay = false}, {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false}, {MAZDA_LKAS_HUD, 0, 8, .check_relay = true}};
++  static const CanMsg MAZDA_RI_TX_MSGS[] = {{MAZDA_LKAS, 0, 8, .check_relay = true}, {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false}, {MAZDA_LKAS_HUD, 0, 8, .check_relay = true},
++                                    {MAZDA_CRZ_CTRL, 0, 8, .check_relay = true}, {MAZDA_CRZ_INFO, 0, 8, .check_relay = true}, {MAZDA_RADAR_361, 0, 8, .check_relay = true}, {MAZDA_RADAR_362, 0, 8, .check_relay = true},
++                                    {MAZDA_RADAR_363, 0, 8, .check_relay = true}, {MAZDA_RADAR_364, 0, 8, .check_relay = true}, {MAZDA_RADAR_365, 0, 8, .check_relay = true}, {MAZDA_RADAR_366, 0, 8, .check_relay = true},
++                                    {MAZDA_RADAR_499, 0, 8, .check_relay = true}};
++  static const CanMsg MAZDA_TI_RI_TX_MSGS[] = {{MAZDA_LKAS, 0, 8, .check_relay = true}, {MAZDA_TI_LKAS, 1, 8, .check_relay = false}, {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false}, {MAZDA_LKAS_HUD, 0, 8, .check_relay = true},
++                                  {MAZDA_CRZ_CTRL, 0, 8, .check_relay = true}, {MAZDA_CRZ_INFO, 0, 8, .check_relay = true}, {MAZDA_RADAR_361, 0, 8, .check_relay = true}, {MAZDA_RADAR_362, 0, 8, .check_relay = true},
++                                  {MAZDA_RADAR_363, 0, 8, .check_relay = true}, {MAZDA_RADAR_364, 0, 8, .check_relay = true}, {MAZDA_RADAR_365, 0, 8, .check_relay = true}, {MAZDA_RADAR_366, 0, 8, .check_relay = true},
++                                  {MAZDA_RADAR_499, 0, 8, .check_relay = true}};
++
++  static const CanMsg MAZDA_2019_TX_MSGS[] = {{MAZDA_TI_LKAS, 1, 8, .check_relay = false}, {MAZDA_2019_ACC, 2, 8, .check_relay = true}};
+ 
+   static RxCheck mazda_rx_checks[] = {
+     {.msg = {{MAZDA_CRZ_CTRL,     0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+@@ -95,13 +243,69 @@ static safety_config mazda_init(uint16_t param) {
+     {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+     {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+   };
++  static RxCheck mazda_ti_rx_checks[] = {
++    {.msg = {{MAZDA_CRZ_CTRL,     0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{TI_STEER_TORQUE,    1, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+ 
+-  SAFETY_UNUSED(param);
+-  return BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
++  };
++  static RxCheck mazda_2019_rx_checks[] = {
++    {.msg = {{MAZDA_2019_BRAKE,         0, 8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_2019_GAS,           2, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_2019_CRUISE,        0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_2019_SPEED,         2, 8, 30U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_2019_STEER_TORQUE,  1, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++  };
++
++  static RxCheck mazda_2023_rx_checks[] = {
++    {.msg = {{MAZDA_2023_BRAKE,         0, 8, 5U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_2019_GAS,           2, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_2019_CRUISE,        1, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_2023_SPEED,         2, 8, 30U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++    {.msg = {{MAZDA_2019_STEER_TORQUE,  1, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++};
++
++  // Check flags
++  gen1 = GET_FLAG(param, FLAG_GEN1);
++  gen2 = GET_FLAG(param, FLAG_GEN2);
++  gen3 = GET_FLAG(param, FLAG_GEN3);
++  radar_interceptor = GET_FLAG(param, FLAG_RADAR_INTERCEPTOR);
++  torque_interceptor = GET_FLAG(param, FLAG_TORQUE_INTERCEPTOR);
++  no_fsc = GET_FLAG(param, FLAG_NO_FSC);
++  no_mrcc = GET_FLAG(param, FLAG_NO_MRCC);
++
++  safety_config ret = BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
++
++  if (gen1) {
++    SET_RX_CHECKS(mazda_rx_checks, ret);
++    if (radar_interceptor && torque_interceptor) {
++      SET_RX_CHECKS(mazda_ti_rx_checks, ret);
++      SET_TX_MSGS(MAZDA_TI_RI_TX_MSGS, ret);
++    } else if (radar_interceptor) {
++      SET_TX_MSGS(MAZDA_RI_TX_MSGS, ret);
++    } else if (torque_interceptor) {
++      SET_RX_CHECKS(mazda_ti_rx_checks, ret);
++      SET_TX_MSGS(MAZDA_TI_TX_MSGS, ret);
++    } else {
++      SET_TX_MSGS(MAZDA_TX_MSGS, ret);
++    }
++  }
++
++  if (gen2) {
++    ret = BUILD_SAFETY_CFG(mazda_2019_rx_checks, MAZDA_2019_TX_MSGS);
++  }
++  if (gen3) {
++    ret = BUILD_SAFETY_CFG(mazda_2023_rx_checks, MAZDA_2019_TX_MSGS);
++  }
++
++  return ret;
+ }
+ 
+ const safety_hooks mazda_hooks = {
+   .init = mazda_init,
+   .rx = mazda_rx_hook,
+   .tx = mazda_tx_hook,
+-};
++};
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/safety/tests/common.py b/opendbc_repo/opendbc/safety/tests/common.py
+index 70e9550..e983101 100644
+--- a/opendbc_repo/opendbc/safety/tests/common.py
++++ b/opendbc_repo/opendbc/safety/tests/common.py
+@@ -1073,6 +1073,9 @@ class SafetyTest(SafetyTestBase):
+               continue
+             if attr.startswith('TestToyota') and current_test.startswith('TestToyota'):
+               continue
++            # Mazda generations share one safety mode, selected by param flags
++            if attr.startswith('TestMazda') and current_test.startswith('TestMazda'):
++              continue
+             if attr.startswith('TestSubaruGen') and current_test.startswith('TestSubaruGen'):
+               continue
+             if attr.startswith('TestSubaruDPlatform') and current_test.startswith('TestSubaruDPlatform'):
+diff --git a/opendbc_repo/opendbc/safety/tests/test_mazda.py b/opendbc_repo/opendbc/safety/tests/test_mazda.py
+index 9b2c1b3..d2d3f62 100755
+--- a/opendbc_repo/opendbc/safety/tests/test_mazda.py
++++ b/opendbc_repo/opendbc/safety/tests/test_mazda.py
+@@ -2,6 +2,7 @@
+ import unittest
+ 
+ from opendbc.car.structs import CarParams
++from opendbc.car.mazda.values import MazdaSafetyFlags
+ from opendbc.safety.tests.libsafety import libsafety_py
+ import opendbc.safety.tests.common as common
+ from opendbc.safety.tests.common import CANPackerSafety
+@@ -26,10 +27,12 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
+   # Mazda actually does not set any bit when requesting torque
+   NO_STEER_REQ_BIT = True
+ 
++  SAFETY_PARAM = MazdaSafetyFlags.GEN1
++
+   def setUp(self):
+     self.packer = CANPackerSafety("mazda_2017")
+     self.safety = libsafety_py.libsafety
+-    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, 0)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, self.SAFETY_PARAM)
+     self.safety.init_tests()
+ 
+   def _torque_meas_msg(self, torque):
+@@ -86,5 +89,60 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
+     return self.packer.make_can_msg_panda("CRZ_CTRL", 0, values)
+ 
+ 
++class TestMazdaTorqueInterceptorSafety(TestMazdaSafety):
++  """Gen1 with the original Torque Interceptor: driver torque comes from the interceptor on bus 1."""
++  TX_MSGS = [[0x243, 0], [0x249, 1], [0x09d, 0], [0x440, 0]]
++  SAFETY_PARAM = MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR
++
++  def _torque_driver_msg(self, torque):
++    values = {"TI_TORQUE_SENSOR": torque}
++    return self.packer.make_can_msg_safety("TI_FEEDBACK", 1, values)
++
++
++class TestMazda2019Safety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest):
++  """Gen2 (2019+ Mazda 3, CX-30, CX-50) with Torque Interceptor 2."""
++  TX_MSGS = [[0x249, 1], [0x220, 2]]
++  STANDSTILL_THRESHOLD = .1
++  RELAY_MALFUNCTION_ADDRS = {2: (0x220,)}
++  FWD_BLACKLISTED_ADDRS = {0: [0x220]}
++
++  MAX_RATE_UP = 45
++  MAX_RATE_DOWN = 80
++  MAX_TORQUE_LOOKUP = [0], [8000]
++  MAX_RT_DELTA = 1688
++  DRIVER_TORQUE_ALLOWANCE = 1400
++  DRIVER_TORQUE_FACTOR = 1
++  NO_STEER_REQ_BIT = True
++
++  def setUp(self):
++    self.packer = CANPackerSafety("mazda_2019")
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, MazdaSafetyFlags.GEN2)
++    self.safety.init_tests()
++
++  def _torque_driver_msg(self, torque):
++    return self.packer.make_can_msg_safety("TI_FEEDBACK", 1, {"STEER_TORQUE_SENSOR": torque})
++
++  def _torque_cmd_msg(self, torque, steer_req=1):
++    return self.packer.make_can_msg_safety("EPS_LKAS", 1, {"LKAS_REQUEST": int(torque) & 0xFFFF})
++
++  def _speed_msg(self, speed):
++    return self.packer.make_can_msg_safety("SPEED", 2, {"SPEED": speed})
++
++  def _user_brake_msg(self, brake):
++    return self.packer.make_can_msg_safety("BRAKE_PEDAL_SLOW", 0, {"BRAKE_PEDAL_PRESSED": brake})
++
++  def _user_gas_msg(self, gas):
++    return self.packer.make_can_msg_safety("ENGINE_DATA", 2, {"PEDAL_GAS": gas})
++
++  def _pcm_status_msg(self, enable):
++    return self.packer.make_can_msg_safety("CRUZE_STATE", 0, {"CRZ_STATE": 3 if enable else 1})
++
++  def test_steer_tx_needs_controls(self):
++    self.safety.set_controls_allowed(0)
++    self.assertFalse(self._tx(self._torque_cmd_msg(100)))
++    self.assertTrue(self._tx(self._torque_cmd_msg(0)))
++
++
+ if __name__ == "__main__":
+   unittest.main()
+diff --git a/panda/board/drivers/can_common.h b/panda/board/drivers/can_common.h
+index 1e3b05e..49fde04 100644
+--- a/panda/board/drivers/can_common.h
++++ b/panda/board/drivers/can_common.h
+@@ -268,6 +268,12 @@ void ignition_can_hook(CANPacket_t *msg) {
+       ignition_can_cnt = 0U;
+     }
+ 
++    // Mazda 2019+ exception
++    if ((msg->addr == 0x274U) && (len == 8)) {
++      ignition_can = (msg->data[5] & 0x4U) != 0U;
++      ignition_can_cnt = 0U;
++    }
++
+     // Volkswagen MEB exception
+     if ((msg->addr == 0x3C0U) && (len == 4)) {
+       int counter = msg->data[1] & 0xFU;
+diff --git a/panda/board/main.c b/panda/board/main.c
+index eacef07..1ad2bca 100644
+--- a/panda/board/main.c
++++ b/panda/board/main.c
+@@ -78,6 +78,17 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
+       current_board->set_can_mode(CAN_MODE_NORMAL);
+       can_silent = false;
+       break;
++    case SAFETY_MAZDA:
++      set_intercept_relay(true, false);
++      heartbeat_counter = 0U;
++      heartbeat_lost = false;
++      if (GET_FLAG(param, 1U) && GET_FLAG(param, 8U)) {  // Gen1 + Torque Interceptor
++        current_board->set_can_mode(CAN_MODE_OBD_CAN2);
++      } else {
++        current_board->set_can_mode(CAN_MODE_NORMAL);
++      }
++      can_silent = false;
++      break;
+     case SAFETY_ELM327:
+       set_intercept_relay(false, false);
+       heartbeat_counter = 0U;
+diff --git a/selfdrive/controls/lib/longcontrol.py b/selfdrive/controls/lib/longcontrol.py
+index 00d9886..2253317 100644
+--- a/selfdrive/controls/lib/longcontrol.py
++++ b/selfdrive/controls/lib/longcontrol.py
+@@ -6,6 +6,7 @@ from openpilot.common.pid import PIDController
+ from openpilot.selfdrive.modeld.constants import ModelConstants
+ from openpilot.common.filter_simple import FirstOrderFilter
+ from openpilot.selfdrive.controls.lib.longcontrol_vehicle_tunes import LongControlVehicleTuning
++from openpilot.common.params import Params
+ 
+ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
+ clip = np.clip
+@@ -117,6 +118,9 @@ class LongControl:
+     self.CP = CP
+     self.long_control_state = LongCtrlState.off
+     self.experimental_mode = False
++    self.experimental_mode_last = False
++    self.mazda_blended_acc = CP.brand == "mazda" and Params().get_bool("BlendedACC")
++    self.params_memory = Params(memory=True)
+     self.pid = PIDController((CP.longitudinalTuning.kpBP, CP.longitudinalTuning.kpV),
+                              (CP.longitudinalTuning.kiBP, CP.longitudinalTuning.kiV),
+                              rate=1 / DT_CTRL)
+@@ -258,6 +262,12 @@ class LongControl:
+                                                        should_stop, CS.brakePressed,
+                                                        CS.cruiseState.standstill, starpilot_toggles,
+                                                        allow_stopping_release=allow_stopping_release)
++
++    if self.mazda_blended_acc:
++      experimental_mode = self.params_memory.get_int("CEStatus")  # 0 means experimental mode is off
++      if experimental_mode and not self.experimental_mode_last:
++        self.reset()
++      self.experimental_mode_last = experimental_mode
+     if self.long_control_state == LongCtrlState.off:
+       self.reset()
+       output_accel = 0.
+diff --git a/selfdrive/ui/layouts/settings/starpilot/vehicle.py b/selfdrive/ui/layouts/settings/starpilot/vehicle.py
+index f300fdc..7d688ea 100644
+--- a/selfdrive/ui/layouts/settings/starpilot/vehicle.py
++++ b/selfdrive/ui/layouts/settings/starpilot/vehicle.py
+@@ -421,6 +421,44 @@ class VehicleSettingsManagerView(PanelManagerView):
+         "set_state": lambda s: self._controller._on_toggle("NostalgiaMode"),
+       })
+ 
++    if cs.isMazda:
++      toggles.append({
++        "title": tr("Enable Torque Interceptor"),
++        "subtitle": tr("Enable the torque interceptor to control the steering wheel."),
++        "get_state": lambda: self._controller._params.get_bool("TorqueInterceptorEnabled"),
++        "set_state": lambda s: self._controller._on_toggle("TorqueInterceptorEnabled"),
++      })
++      toggles.append({
++        "title": tr("Enable Radar Interceptor"),
++        "subtitle": tr("Enable if you have installed a radar interceptor."),
++        "get_state": lambda: self._controller._params.get_bool("RadarInterceptorEnabled"),
++        "set_state": lambda s: self._controller._on_toggle("RadarInterceptorEnabled"),
++      })
++      toggles.append({
++        "title": tr("Disable Stock MRCC"),
++        "subtitle": tr("Enable if your car does not have stock MRCC."),
++        "get_state": lambda: self._controller._params.get_bool("NoMRCC"),
++        "set_state": lambda s: self._controller._on_toggle("NoMRCC"),
++      })
++      toggles.append({
++        "title": tr("Disable Stock FSC"),
++        "subtitle": tr("Enable if your car does not have stock FSC."),
++        "get_state": lambda: self._controller._params.get_bool("NoFSC"),
++        "set_state": lambda s: self._controller._on_toggle("NoFSC"),
++      })
++      toggles.append({
++        "title": tr("Blended ACC"),
++        "subtitle": tr("Use stock Mazda radar cruise unless Conditional Experimental Mode is active."),
++        "get_state": lambda: self._controller._params.get_bool("BlendedACC"),
++        "set_state": lambda s: self._controller._on_toggle("BlendedACC"),
++      })
++      toggles.append({
++        "title": tr("Manual Transmission"),
++        "subtitle": tr("Enable if your car has a manual transmission."),
++        "get_state": lambda: self._controller._params.get_bool("ManualTransmission"),
++        "set_state": lambda s: self._controller._on_toggle("ManualTransmission"),
++      })
++
+     return toggles
+ 
+   def _rebuild_toggle_grid(self):
+diff --git a/selfdrive/ui/lib/starpilot_state.py b/selfdrive/ui/lib/starpilot_state.py
+index a736156..ea87301 100644
+--- a/selfdrive/ui/lib/starpilot_state.py
++++ b/selfdrive/ui/lib/starpilot_state.py
+@@ -27,6 +27,7 @@ class StarPilotCarState:
+     isTorqueCar: bool = False
+     isTSK: bool = False
+     isHKGCanFd: bool = False
++    isMazda: bool = False
+     
+     # ========== Car Capabilities ==========
+     hasBSM: bool = False
+@@ -98,6 +99,7 @@ class StarPilotState:
+             self.car_state.isSubaru = brand == "subaru"
+             self.car_state.isTesla = brand == "tesla"
+             self.car_state.isToyota = brand == "toyota"
++            self.car_state.isMazda = brand == "mazda"
+             self.car_state.isHKGCanFd = False
+             self.car_state.hasModeStarButtons = False
+             self.car_state.isBolt = False
+@@ -174,6 +176,7 @@ class StarPilotState:
+             self.car_state.isSubaru = car_make == "subaru"
+             self.car_state.isTesla = car_make == "tesla"
+             self.car_state.isToyota = car_make == "toyota"
++            self.car_state.isMazda = car_make == "mazda"
+             self.car_state.isTSK = bool(self._safe_get(CP, "secOcRequired", False))
+             self.car_state.isVolt = car_fingerprint.startswith("CHEVROLET_VOLT")
+             
+diff --git a/selfdrive/ui/mici/layouts/settings/toggles.py b/selfdrive/ui/mici/layouts/settings/toggles.py
+index 6ec5418..58ed3bf 100644
+--- a/selfdrive/ui/mici/layouts/settings/toggles.py
++++ b/selfdrive/ui/mici/layouts/settings/toggles.py
+@@ -29,6 +29,12 @@ class TogglesLayoutMici(NavScroller):
+     record_front = BigParamControl("record & upload driver camera", "RecordFront", toggle_callback=restart_needed_callback)
+     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
+     enable_openpilot = BigParamControl("enable openpilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
++    mazda_torqueinterceptorenabled = BigParamControl("torque interceptor", "TorqueInterceptorEnabled", toggle_callback=restart_needed_callback)
++    mazda_radarinterceptorenabled = BigParamControl("radar interceptor", "RadarInterceptorEnabled", toggle_callback=restart_needed_callback)
++    mazda_nomrcc = BigParamControl("no stock MRCC", "NoMRCC", toggle_callback=restart_needed_callback)
++    mazda_nofsc = BigParamControl("no stock FSC", "NoFSC", toggle_callback=restart_needed_callback)
++    mazda_blendedacc = BigParamControl("blended ACC", "BlendedACC", toggle_callback=restart_needed_callback)
++    mazda_manualtransmission = BigParamControl("manual transmission", "ManualTransmission", toggle_callback=restart_needed_callback)
+ 
+     self._scroller.add_widgets([
+       self._personality_toggle,
+@@ -41,6 +47,12 @@ class TogglesLayoutMici(NavScroller):
+       record_front,
+       record_mic,
+       enable_openpilot,
++      mazda_torqueinterceptorenabled,
++      mazda_radarinterceptorenabled,
++      mazda_nomrcc,
++      mazda_nofsc,
++      mazda_blendedacc,
++      mazda_manualtransmission,
+     ])
+ 
+     # Toggle lists
+@@ -54,9 +66,21 @@ class TogglesLayoutMici(NavScroller):
+       ("RecordFront", record_front),
+       ("RecordAudio", record_mic),
+       ("OpenpilotEnabledToggle", enable_openpilot),
++      ("TorqueInterceptorEnabled", mazda_torqueinterceptorenabled),
++      ("RadarInterceptorEnabled", mazda_radarinterceptorenabled),
++      ("NoMRCC", mazda_nomrcc),
++      ("NoFSC", mazda_nofsc),
++      ("BlendedACC", mazda_blendedacc),
++      ("ManualTransmission", mazda_manualtransmission),
+     )
+ 
+     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
++    mazda_torqueinterceptorenabled.set_visible(lambda: ui_state.CP is not None and ui_state.CP.brand == "mazda")
++    mazda_radarinterceptorenabled.set_visible(lambda: ui_state.CP is not None and ui_state.CP.brand == "mazda")
++    mazda_nomrcc.set_visible(lambda: ui_state.CP is not None and ui_state.CP.brand == "mazda")
++    mazda_nofsc.set_visible(lambda: ui_state.CP is not None and ui_state.CP.brand == "mazda")
++    mazda_blendedacc.set_visible(lambda: ui_state.CP is not None and ui_state.CP.brand == "mazda")
++    mazda_manualtransmission.set_visible(lambda: ui_state.CP is not None and ui_state.CP.brand == "mazda")
+     record_front.set_enabled(False if ui_state.params.get_bool("RecordFrontLock") else (lambda: not ui_state.engaged))
+     record_mic.set_enabled(lambda: not ui_state.engaged)
+ 
