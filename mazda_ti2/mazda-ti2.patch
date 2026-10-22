@@ -472,7 +472,7 @@ index 8ddf777..21d8689 100644
 +      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_signals, 2),
      }
 diff --git a/opendbc_repo/opendbc/car/mazda/fingerprints.py b/opendbc_repo/opendbc/car/mazda/fingerprints.py
-index 5569e28..4d8f5ba 100644
+index 5569e28..a589d99 100644
 --- a/opendbc_repo/opendbc/car/mazda/fingerprints.py
 +++ b/opendbc_repo/opendbc/car/mazda/fingerprints.py
 @@ -129,6 +129,26 @@ FW_VERSIONS = {
@@ -502,7 +502,7 @@ index 5569e28..4d8f5ba 100644
    CAR.MAZDA_CX9: {
      (Ecu.eps, 0x730, None): [
        b'K070-3210X-C-00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
-@@ -280,4 +300,108 @@ FW_VERSIONS = {
+@@ -280,4 +300,111 @@ FW_VERSIONS = {
        b'PXM7-21PS1-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
      ],
    },
@@ -515,6 +515,7 @@ index 5569e28..4d8f5ba 100644
 +      b'BCKA-3216X-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +    ],
 +    (Ecu.engine, 0x7e0, None): [
++      b'PXNA-188K2-F\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      b'PX4L-188K2-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      b'PA2J-188K2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      #b'PX06-188K2-S\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
@@ -523,6 +524,7 @@ index 5569e28..4d8f5ba 100644
 +      b'PX4W-188K2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +    ],
 +    (Ecu.fwdRadar, 0x764, None): [
++      b'B0N2-67XK2-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      b'BDTS-67XK2-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      #b'B0N2-67XK2-A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      b'B0N2-67XK2-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
@@ -542,6 +544,7 @@ index 5569e28..4d8f5ba 100644
 +      b'DFR5-67WK2-C\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +    ],
 +    (Ecu.transmission, 0x7e1, None): [
++      b'PXLS-21PS1-A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      b'PX4L-21PS1-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      b'PAM6-21PS1-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
 +      #b'PX01-21PS1-E\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
@@ -1088,7 +1091,7 @@ index 0000000..9f870c8
 +    return ret
 \ No newline at end of file
 diff --git a/opendbc_repo/opendbc/car/mazda/values.py b/opendbc_repo/opendbc/car/mazda/values.py
-index 80c3455..bb5b98c 100644
+index 80c3455..85b32e6 100644
 --- a/opendbc_repo/opendbc/car/mazda/values.py
 +++ b/opendbc_repo/opendbc/car/mazda/values.py
 @@ -9,20 +9,39 @@ from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries
@@ -1274,7 +1277,7 @@ index 80c3455..bb5b98c 100644
 +      [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.MANUFACTURER_SOFTWARE_VERSION_REQUEST],
 +      [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.MANUFACTURER_SOFTWARE_VERSION_RESPONSE],
 +      bus=0,
-+      whitelist_ecus=[Ecu.eps, Ecu.abs, Ecu.fwdRadar, Ecu.fwdCamera, Ecu.shiftByWire],
++      whitelist_ecus=[Ecu.eps, Ecu.abs, Ecu.fwdRadar, Ecu.fwdCamera],
 +    )
    ],
  )
@@ -1283,7 +1286,6 @@ index 80c3455..bb5b98c 100644
 +GEN1 = CAR.with_flags(MazdaSafetyFlags.GEN1)
 +GEN2 = CAR.with_flags(MazdaSafetyFlags.GEN2)
 +GEN3 = CAR.with_flags(MazdaSafetyFlags.GEN3)
-\ No newline at end of file
 diff --git a/opendbc_repo/opendbc/car/tests/routes.py b/opendbc_repo/opendbc/car/tests/routes.py
 index 33ab434..7caeecc 100644
 --- a/opendbc_repo/opendbc/car/tests/routes.py
@@ -1302,6 +1304,42 @@ index 33ab434..7caeecc 100644
    GM.CADILLAC_ATS,
    GM.CADILLAC_ESCALADE_ASCM,
    GM.CADILLAC_ESCALADE_ESV_2019_ASCM,
+diff --git a/opendbc_repo/opendbc/car/tests/test_mazda_2023_fingerprint.py b/opendbc_repo/opendbc/car/tests/test_mazda_2023_fingerprint.py
+new file mode 100644
+index 0000000..e84ec10
+--- /dev/null
++++ b/opendbc_repo/opendbc/car/tests/test_mazda_2023_fingerprint.py
+@@ -0,0 +1,30 @@
++from opendbc.car.fw_versions import match_fw_to_car
++from opendbc.car.mazda.values import CAR
++from opendbc.car.structs import CarParams
++
++
++def test_2023_mazda3_captured_firmware():
++  """The six ECUs captured from the 2023 Mazda3 BP must uniquely identify GEN2."""
++  ecu = CarParams.Ecu
++  captured = [
++    (ecu.engine, 0x7e0, b'PXNA-188K2-F', 12),
++    (ecu.transmission, 0x7e1, b'PXLS-21PS1-A', 12),
++    (ecu.fwdCamera, 0x706, b'DFR5-67WK2-E', 12),
++    (ecu.eps, 0x730, b'BCKA-3216X-E', 12),
++    (ecu.abs, 0x760, b'BHCB-4300F-', 13),
++    (ecu.fwdRadar, 0x764, b'B0N2-67XK2-E', 12),
++  ]
++  live = []
++  for kind, address, value, padding in captured:
++    fw = CarParams.CarFw.new_message()
++    fw.ecu = kind
++    fw.address = address
++    fw.brand = 'mazda'
++    fw.bus = 0
++    fw.obdMultiplexing = True
++    fw.fwVersion = value + b'\x00' * padding
++    live.append(fw)
++
++  exact, matches = match_fw_to_car(live, '', log=False)
++  assert exact
++  assert matches == {CAR.MAZDA_3_2019}
 diff --git a/opendbc_repo/opendbc/car/torque_data/override.toml b/opendbc_repo/opendbc/car/torque_data/override.toml
 index 33c6304..319108a 100644
 --- a/opendbc_repo/opendbc/car/torque_data/override.toml
