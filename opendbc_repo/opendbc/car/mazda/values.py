@@ -85,6 +85,7 @@ class Footnote(Enum):
 @dataclass(frozen=True, kw_only=True)
 class MazdaCarSpecs(CarSpecs):
   tireStiffnessFactor: float = 0.7  # not optimized yet
+  centerToFrontRatio: float = 0.41
 
 
 class MazdaSafetyFlags(IntFlag):
