@@ -95,9 +95,16 @@ TI1_AOL_SAFETY_PARAM = int(MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTER
 
 # Evidence gates for the TI1 profile. Each stays False until closed with recorded evidence.
 TI1_EVIDENCE_GATES = {
-  # OPEN: a CX-8 TI1 capture must show 0x21C bit 17 following the cruise main switch, 0x228
-  # decoding P/R/N/D, and the 0x243 camera LKAS bit, on the buses the GEN1 profile reads.
-  'cx8_signals': False,
+  # CLOSED 2026-11-12 on a CX-8 TI1 capture (route 8762fabfa41efd82/0000000d--abcaf6b0e1, build 89c300a):
+  #   - 0x21C bit 17 followed the cruise main switch on all 7 toggles (5 parked, 2 driving), matching
+  #     carState cruiseState.available each time; byte 0 bit 3 matched all 3 cruise engagements.
+  #   - 0x228 byte 0 & 7 decoded P=1, R=2, N=3, D=4 with a transient 0 between gears, matching
+  #     carState.gearShifter on every shift; only 4 is Drive, so P/R/N and 0 restrict.
+  #   - 0x243 bus 2 bit 16 (camera ERR_BIT_1) stayed 0 (no camera fault), the same meaning as stock GEN1.
+  #   - 0x241 bit 50 (EPS lockout) read 1 for the whole route, driving included: the stock GEN1 source
+  #     would never admit this car, which is why TI_FEEDBACK liveness replaces it.
+  #   - TI_FEEDBACK: power-up 0x12, then RUN with no violations.
+  'cx8_signals': True,
 }
 
 

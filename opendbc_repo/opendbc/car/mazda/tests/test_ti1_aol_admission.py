@@ -31,14 +31,16 @@ def test_param_is_the_exact_ti1_word():
   assert TI1_AOL_SAFETY_PARAM == 9
 
 
-def test_target_car_matches_and_is_admitted_only_with_closed_gates():
+def test_target_car_matches_and_is_admitted_with_the_recorded_gates():
   cp = make_cp()
   assert ti1_configuration(cp, marked_only=True)
   assert ti1_qualified(cp, CLOSED_GATES, marked_only=True)
-  # The recorded gates are open until the CX-8 capture is checked, so nothing is admitted yet.
-  assert not all(TI1_EVIDENCE_GATES.values())
-  assert not ti1_qualified(cp, marked_only=True)
-  assert not admitted(cp, marked_only=True)
+  # The CX-8 capture closed the recorded gates, so the target car is admitted.
+  assert all(TI1_EVIDENCE_GATES.values())
+  assert ti1_qualified(cp, marked_only=True)
+  assert admitted(cp, marked_only=True)
+  # An open gate still blocks it.
+  assert not ti1_qualified(cp, {name: False for name in TI1_EVIDENCE_GATES}, marked_only=True)
 
 
 @pytest.mark.parametrize("gates", [{}, {"cx8_signals": True, "extra": True}, {"other": True}])

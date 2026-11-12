@@ -26,10 +26,17 @@ def test_native_profile_includes_ti1():
   assert aol.native_profile_supported(MAZDA_MODEL, TI1)
 
 
-def test_policy_stays_off_while_the_gate_is_open():
+def test_policy_stays_off_while_a_gate_is_open():
+  with mock.patch.dict(stock_aol.TI1_EVIDENCE_GATES, dict.fromkeys(stock_aol.TI1_EVIDENCE_GATES, False)):
+    policy = aol.policy_for(ti1_cp())
+    assert not policy.intent_supported and policy.alternative_experience_addition == 0
+    assert not aol.native_accepts_cp(ti1_cp(32), MAZDA_MODEL, TI1)
+
+
+def test_recorded_gates_admit_the_cx8():
   policy = aol.policy_for(ti1_cp())
-  assert not policy.intent_supported and policy.alternative_experience_addition == 0
-  assert not aol.native_accepts_cp(ti1_cp(32), MAZDA_MODEL, TI1)
+  assert policy.intent_supported and policy.alternative_experience_addition == 32
+  assert aol.native_accepts_cp(ti1_cp(32), MAZDA_MODEL, TI1)
 
 
 def test_policy_and_native_profile_once_the_gate_closes():
