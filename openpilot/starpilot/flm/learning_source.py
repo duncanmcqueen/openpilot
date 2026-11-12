@@ -49,6 +49,11 @@ def automatic_capability(CP, controller):
     return capability if capability is not None and factor_edit_supported(CP, mode) else None
   if mode != ControllerMode.STANDARD:
     return None
+  # A GEN1 Mazda TI1 shapes latAccelFactor/friction by speed every frame (starpilot/car/mazda/ti1_lateral.py),
+  # which the scalar fit and native checkpoint validation cannot represent: no automatic learning for it.
+  from openpilot.starpilot.car.mazda.ti1_lateral import is_ti1
+  if is_ti1(CP):
+    return None
   return {'fingerprint': str(CP.carFingerprint), 'controller': str(mode), 'policy': 'native_standard',
           'basis': basis, 'profile': 'torque_linear'}
 

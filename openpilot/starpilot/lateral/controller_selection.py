@@ -99,6 +99,12 @@ def policy_for(CP) -> str | None:
   """Prefer exact vehicle policies, otherwise use the shared torque law."""
   if CP.notCar:
     return None
+  # A GEN1 Mazda with the Torque Interceptor has its own tune inside the standard controller
+  # (starpilot/car/mazda/ti1_lateral.py), which the StarPilot torque law would bypass. No policy keeps it on
+  # the standard controller: the StarPilot mode cannot be selected, and a saved selection does not apply.
+  from openpilot.starpilot.car.mazda.ti1_lateral import is_ti1
+  if is_ti1(CP):
+    return None
   from openpilot.starpilot.lateral.hkg_vehicle_policy import policy_for as hkg_vehicle_policy
   profile = hkg_vehicle_policy(CP)
   if profile is not None:

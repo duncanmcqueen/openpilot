@@ -115,4 +115,56 @@ def test_update_scales_the_error_only_for_ti1():
       _, _, log = lac.update_standard(True, cs, vm, params, False, 0.5 / 5.0**2, False, 0.2)
     errors[name] = log.error
   assert errors["stock"] == pytest.approx(0.5, rel=1e-3)
-  assert errors["ti1"] == pytest.approx(0.5 * ti1_lateral.error_factor(5.0), rel=1e-3)
+  assert errors["ti1"] == pytest.approx(0.5 * 0.28804348, rel=1e-3)  # literal: see test_error_factor_is_the_tuned_value_at_5_mps
+
+
+def test_error_factor_is_the_tuned_value_at_5_mps():
+  # Literal, not computed by the helper under test: (1 + (11.25 / 5)^2 / 11.5) * 0.2.
+  assert ti1_lateral.error_factor(5.0) == pytest.approx(0.28804348, rel=1e-6)
+
+
+def _selection_cp(flags):
+  cp = make_cp(flags=flags)
+  cp.steerControlType = structs.CarParams.SteerControlType.torque
+  cp.lateralTuning.torque.steeringAngleDeadzoneDeg = 0.0
+  return cp.as_reader()
+
+
+def test_ti1_cannot_select_the_starpilot_controller():
+  # Independent review P1: the StarPilot torque law bypasses the TI1 error shaping.
+  from openpilot.starpilot.lateral import controller_selection as sel
+  stock = _selection_cp(int(MazdaSafetyFlags.GEN1))
+  assert sel.policy_for(stock) == 'generic'  # other Mazdas keep their choice
+  ti1 = _selection_cp(TI1)
+  assert sel.policy_for(ti1) is None
+  assert sel.default_selection(ti1).mode == sel.ControllerMode.STANDARD
+  with pytest.raises(ValueError):
+    sel.replace_mode(None, ti1, sel.ControllerMode.STARPILOT)
+  saved = sel.replace_mode(None, stock, sel.ControllerMode.STARPILOT)  # a choice saved before the TI1 was fitted
+  assert sel.selection_from_bytes(ti1, saved).mode == sel.ControllerMode.STANDARD
+
+
+def test_ti1_is_excluded_from_automatic_steering_learning():
+  # Independent review P2: speed shaping is not representable by the scalar fit or native validation.
+  from openpilot.starpilot.flm.learning_source import automatic_capability
+  assert automatic_capability(_selection_cp(TI1), 'standard') is None
+  assert automatic_capability(_selection_cp(int(MazdaSafetyFlags.GEN1)), 'standard') is not None
+
+
+@needs_params
+def test_native_learning_baseline_records_the_ti1_limits():
+  lac = _controller(make_cp())
+  assert lac.native_learning_baseline[0] == pytest.approx(0.875)
+  assert lac.native_learning_baseline == tuple(__import__('openpilot.starpilot.flm.runtime_adapter_registry',
+                                                          fromlist=['baseline_values']).baseline_values(lac))
+
+
+@needs_params
+def test_public_update_shapes_every_frame():
+  # Review test gap: the shape must be applied through update(), not only through the private helper.
+  vm = SimpleNamespace(calc_curvature=lambda angle, v, roll: 0.0)
+  params = SimpleNamespace(angleOffsetDeg=0.0, roll=0.0)
+  lac = _controller(make_cp())
+  for v, factor in ((5.0, 1.76 * 1.3), (25.0, 1.76)):
+    lac.update(True, structs.CarState(vEgo=v, steeringAngleDeg=0.0, steeringPressed=False), vm, params, False, 0.0, False, 0.2)
+    assert float(lac.torque_params.latAccelFactor) == pytest.approx(factor, rel=1e-6)

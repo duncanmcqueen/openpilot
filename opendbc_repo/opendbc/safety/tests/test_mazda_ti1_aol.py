@@ -40,11 +40,11 @@ class TestMazdaTi1Aol(unittest.TestCase):
   def feedback(self, state=TI_RUN, viol=0):
     return self.packet('TI_FEEDBACK', {'STATE': state, 'VIOL': viol, 'VERSION_NUMBER': 1, 'TI_TORQUE_SENSOR': 0}, 1)
 
-  def feed(self, main=True, reverse=False, lkas_block=False, state=TI_RUN, viol=0, feedback=True, advance_us=0):
+  def feed(self, main=True, reverse=False, lkas_block=False, state=TI_RUN, viol=0, feedback=True, advance_us=0, engaged=False):
     self.time += advance_us
     self.safety.set_timer(self.time)
     sources = [
-      ('CRZ_CTRL', 0, {'CRZ_AVAILABLE': int(main), 'CRZ_ACTIVE': 0}),
+      ('CRZ_CTRL', 0, {'CRZ_AVAILABLE': int(main), 'CRZ_ACTIVE': int(engaged)}),
       ('CRZ_BTNS', 0, {'RES': 0, 'SET_M': 0, 'CAN_OFF': 0}),
       ('STEER_TORQUE', 0, {'STEER_TORQUE_SENSOR': 0}),
       ('ENGINE_DATA', 0, {'SPEED': 80, 'PEDAL_GAS': 0}),
@@ -152,6 +152,72 @@ class TestMazdaTi1Aol(unittest.TestCase):
       self.feed()
     self.assertEqual(self.safety.aol_get_permission_mask(), 0)
     self.assertEqual(self.steer(10), (False, False))
+
+  def test_permanent_violation_revokes_until_a_fresh_driver_action(self):
+    # Independent review P1: a class 1 (or unknown) code must not come back on clean feedback alone.
+    for viol in (0x19, 0x15, 0x41, 0x5A):
+      with self.subTest(viol=hex(viol)):
+        self.configure()
+        self.arm()
+        self.feed(state=TI_OFF, viol=viol)
+        self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+        self.assertFalse(self.safety.get_controls_allowed())
+        for _ in range(5):
+          self.feed()
+        self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+        self.assertEqual(self.steer(10), (False, False))
+        self.arm()  # a new main edge re-arms once the TI1 is healthy
+
+  def test_driver_action_during_a_permanent_violation_does_not_survive_it(self):
+    self.configure()
+    self.arm()
+    for _ in range(3):  # the driver re-arms while the fault is still reported
+      self.feed(state=TI_OFF, viol=0x19)
+    self.feed(main=False, state=TI_OFF, viol=0x19)
+    self.feed(main=True, state=TI_OFF, viol=0x19)
+    self.feed()
+    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+
+  def test_permanent_violation_also_drops_ordinary_engagement(self):
+    self.configure(experience=0)
+    for _ in range(3):
+      self.feed()
+    self.feed(engaged=True)  # the driver engages cruise: a rising edge
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.feed(engaged=True, state=TI_OFF, viol=0x19)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.feed(engaged=True)  # clean feedback with cruise still on does not re-engage
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_recoverable_violations_keep_the_token(self):
+    for viol in (0x11, 0x12, 0x13, 0x14, 0x17, 0x18, 0x22, 0x25, 0x31, 0x32, 0x33, 0x34):
+      with self.subTest(viol=hex(viol)):
+        self.configure()
+        self.arm()
+        self.feed(state=TI_OFF, viol=viol)
+        self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+        self.feed()
+        self.assertEqual(self.safety.aol_get_permission_mask(), 1)
+
+  def test_driver_override_refuses_nonzero_ti_torque_under_aol(self):
+    # Review test gap: lateral permission stays during DRIVER_OVER, but the TI1 tx check must still refuse.
+    self.configure()
+    self.arm()
+    self.feed(state=TI_DRIVER_OVER)
+    self.assertEqual(self.safety.aol_get_permission_mask(), 1)
+    self.assertEqual(self.steer(10), (True, False))
+
+
+def test_panda_recoverable_codes_match_the_host_table():
+  import re
+  from pathlib import Path
+  from opendbc.car.mazda.torque_interceptor import PERMANENT_CLASS, VIOLATIONS
+  source = (Path(__file__).parents[1] / "modes" / "mazda.h").read_text()
+  body = source[source.index("static bool mazda_ti1_viol_recoverable"):]
+  body = body[:body.index("default:")]
+  panda = {int(code, 16) for code in re.findall(r"case (0x[0-9A-Fa-f]+)U:", body)}
+  host = {code for code, (_, cls, _) in VIOLATIONS.items() if cls != PERMANENT_CLASS}
+  assert panda == host
 
 
 if __name__ == '__main__':

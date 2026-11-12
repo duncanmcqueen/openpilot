@@ -180,6 +180,34 @@ static bool mazda_ti1_healthy(void) {
 // keep permission: the TI ignores torque then and the tx check already refuses nonzero 0x249.
 // Silence is covered by the AOL source freshness (TI_FEEDBACK is the TI1 EPS source).
 #define MAZDA_TI1_STATE_DRIVER_OVER 2U
+
+// TI1 violations that clear by themselves (classes 2 and 3 in car/mazda/torque_interceptor.py VIOLATIONS).
+// Any other nonzero code, class 1 (cleared only by a TI power cycle) or unknown, is treated as permanent:
+// fail closed.
+static bool mazda_ti1_viol_recoverable(uint8_t viol) {
+  bool recoverable = false;
+  switch (viol) {
+    case 0x11U:  // LKAS_STUK
+    case 0x12U:  // CAN_TMO
+    case 0x13U:  // LKAS_ERR
+    case 0x14U:  // LOW_VOLT
+    case 0x17U:  // TORQUE_H
+    case 0x18U:  // TORQUE_L
+    case 0x22U:  // HIGH_TMP
+    case 0x25U:  // TK_TRNSF
+    case 0x31U:  // HIN_ERR
+    case 0x32U:  // TK_NLOAD
+    case 0x33U:  // TK_WLOAD
+    case 0x34U:  // CAN_ERR
+      recoverable = true;
+      break;
+    default:
+      recoverable = false;
+      break;
+  }
+  return recoverable;
+}
+
 static bool mazda_ti1_aol_blocked(void) {
   return mazda_gen1 && mazda_torque_interceptor &&
     ((mazda_ti1_viol != 0U) ||
@@ -309,6 +337,15 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
       mazda_ti1_state = msg->data[3];
       mazda_ti1_viol = msg->data[4];
       mazda_ti1_ramp_down = (msg->data[2] > 1U) && (msg->data[6] != 0U);
+
+      // A permanent (or unknown) TI1 violation revokes authorization outright, on every frame it is
+      // reported: the AOL token and ordinary engagement. Clean feedback afterwards never restores it;
+      // steering needs healthy feedback and a fresh driver action. Recoverable violations only withhold
+      // lateral (mazda_ti1_aol_blocked) and the tx check.
+      if ((mazda_ti1_viol != 0U) && !mazda_ti1_viol_recoverable(mazda_ti1_viol)) {
+        controls_allowed = false;
+        mazda_aol_clear();
+      }
     }
 
     // enter controls on rising edge of ACC, exit controls on ACC off

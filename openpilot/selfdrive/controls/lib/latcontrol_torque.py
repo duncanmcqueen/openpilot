@@ -74,16 +74,9 @@ class LatControlTorque(LatControl):
     self.flm_surface = None
     self.manual_flm_effects = None
     self.manual_flm_status = 'not_configured'
-    from openpilot.starpilot.flm.runtime_adapter_registry import baseline_values
-
-    self.native_learning_baseline = baseline_values(self)
-    self.native_learning_refinement = None
-    self.native_learning_provenance = ()
-    self.native_learning_last_tick = 0
-    self.native_learning_source = None
-
     # GEN1 Mazda Torque Interceptor (TI1): limit at the TI ceiling, speed-shaped plant and low-speed error
-    # (openpilot/starpilot/car/mazda/ti1_lateral.py). Other cars, including TI2, are untouched.
+    # (openpilot/starpilot/car/mazda/ti1_lateral.py). Other cars, including TI2, are untouched. Set up before
+    # the native learning baseline below, so that baseline records the TI1 limits.
     self.mazda_ti1 = mazda_ti1_lateral.is_ti1(CP)
     self.mazda_ti1_base = None
     self.mazda_ti1_v_ego = 0.0
@@ -91,6 +84,14 @@ class LatControlTorque(LatControl):
       self.steer_max = mazda_ti1_lateral.steer_max(CP)
       self.mazda_ti1_base = (float(self.torque_params.latAccelFactor), float(self.torque_params.friction))
       self.update_limits()
+
+    from openpilot.starpilot.flm.runtime_adapter_registry import baseline_values
+
+    self.native_learning_baseline = baseline_values(self)
+    self.native_learning_refinement = None
+    self.native_learning_provenance = ()
+    self.native_learning_last_tick = 0
+    self.native_learning_source = None
 
   def _apply_mazda_ti1_shape(self, v_ego):
     self.mazda_ti1_v_ego = v_ego
