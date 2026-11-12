@@ -80,7 +80,9 @@ class LatControlTorque(LatControl):
     self.mazda_ti1 = mazda_ti1_lateral.is_ti1(CP)
     self.mazda_ti1_base = None
     self.mazda_ti1_v_ego = 0.0
+    self.mazda_ti1_response = 1.0
     if self.mazda_ti1:
+      self.mazda_ti1_response = mazda_ti1_lateral.response_scale()  # the driver's Steering Response, read per drive
       self.steer_max = mazda_ti1_lateral.steer_max(CP)
       self.mazda_ti1_base = (float(self.torque_params.latAccelFactor), float(self.torque_params.friction))
       self.update_limits()
@@ -169,8 +171,9 @@ class LatControlTorque(LatControl):
     setpoint = expected_lateral_accel
     error = setpoint - measurement
     if self.mazda_ti1:
-      # P and the friction input, as in the TI1 tune this was ported from (ti1_lateral.error_factor).
-      error *= mazda_ti1_lateral.error_factor(CS.vEgo)
+      # P and the friction input, as in the TI1 tune this was ported from (ti1_lateral.error_factor), scaled by
+      # the driver's Steering Response setting.
+      error *= mazda_ti1_lateral.error_factor(CS.vEgo) * self.mazda_ti1_response
 
     lookahead_idx = int(np.clip(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len + 1, -2))
     raw_lateral_jerk = (self.lat_accel_request_buffer[lookahead_idx + 1] - self.lat_accel_request_buffer[lookahead_idx - 1]) / (2 * self.dt)

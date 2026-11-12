@@ -400,6 +400,8 @@ def main():
   lag_learner = LateralLagEstimator(CP, 1. / SERVICE_LIST['deviceMotion'].frequency)
   from openpilot.starpilot.lateral.gm_geometry_runtime import GeometryPublicationOwner
   geometry_owner = GeometryPublicationOwner(params, CP)
+  from openpilot.starpilot.car.mazda.ti1_lateral import DelayPublication
+  mazda_ti1_delay = DelayPublication(CP, params)  # TI1 Actuator Delay setting; inert on every other car
   if (initial_lag_params := retrieve_initial_lag(params, CP)) is not None:
     lag, valid_blocks = initial_lag_params
     lag_learner.reset(lag, valid_blocks)
@@ -417,7 +419,7 @@ def main():
     if sm.frame % 5 == 0:
       lag_learner.update_estimate()
       lag_msg = lag_learner.get_msg(sm.all_checks(), DEBUG)
-      lag_msg_dat = geometry_owner.delay(lag_msg).to_bytes()
+      lag_msg_dat = mazda_ti1_delay.delay(geometry_owner.delay(lag_msg)).to_bytes()
       pm.send('lateralDelay', lag_msg_dat)
 
       if sm.frame % 1200 == 0: # cache every 60 seconds

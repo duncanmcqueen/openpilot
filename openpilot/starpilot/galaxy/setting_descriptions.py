@@ -46,6 +46,10 @@ DESCRIPTIONS = {
   'torque_prepare_firestar': 'Prepares steering settings for a tuning-request recording. Turning it off restores the previous settings.',
   'SteerLatAccel': 'Sets the legacy lateral-acceleration-to-torque conversion. Review the vehicle-specific tuning profile before applying it.',
   'SteerFriction': 'Sets legacy steering friction compensation. Review the vehicle-specific tuning profile before applying it.',
+  'MazdaTI1SteerResponse': ('Mazda Torque Interceptor (GEN1) steering response. 100% is the tuned response; lower is gentler, ' +
+                            'higher is firmer. Applies from the next drive.'),
+  'MazdaTI1ActuatorDelay': ('Mazda Torque Interceptor (GEN1) steering actuator delay in seconds. 0 uses the learned delay. ' +
+                            'Applies from the next drive.'),
   'UseStarPilotLongitudinalPlanner': 'Selects the StarPilot acceleration, braking and following planner. Off selects the upstream planner.',
   'CustomCruise': 'Sets how much a short cruise-button press changes the set speed.',
   'CustomCruiseLong': 'Sets how much holding a cruise button changes the set speed.',

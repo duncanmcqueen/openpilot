@@ -117,7 +117,11 @@ FLOAT_SPECS = {
   **{f"{name}{suffix}": (25.0, 200.0, 5.0, "%")
      for name in ("Aggressive", "Standard", "Relaxed")
      for suffix in ("JerkAcceleration", "JerkDeceleration", "JerkDanger", "JerkSpeedDecrease", "JerkSpeed")},
+  # GEN1 Mazda Torque Interceptor tune (starpilot/car/mazda/ti1_lateral.py).
+  "MazdaTI1SteerResponse": (50.0, 150.0, 5.0, "%"),
+  "MazdaTI1ActuatorDelay": (0.0, 0.8, 0.01, "s"),
 }
+MAZDA_TI1_KEYS = ("MazdaTI1SteerResponse", "MazdaTI1ActuatorDelay")
 SLC_PRIORITY, SLC_SECONDARY, SLC_TERTIARY = SOURCE_PRIORITY_KEYS
 LONG_PREFIX = "profile:"
 PRESETS = {"acceleration": ACCELERATION_PRESETS, "braking": BRAKING_PRESETS, "following": FOLLOWING_PRESETS}
@@ -904,6 +908,18 @@ class FeatureSettingsOwner:
            "Enable if your car has a manual transmission."),
         ):
           rows.append(self._bool_row(key, label, mazda_allowed, reason + " Applies after the next startup."))
+        from openpilot.starpilot.car.mazda.ti1_lateral import is_ti1
+        if is_ti1(cp):
+          for key, label, reason in (
+            ("MazdaTI1SteerResponse", "TI Steering Response",
+             ("How strongly steering corrects toward the path. 100% is the tuned response; lower is gentler, " +
+              "higher is firmer. Applies from the next drive.")),
+            ("MazdaTI1ActuatorDelay", "TI Actuator Delay",
+             ("Steering actuator delay in seconds. 0 uses the delay learned while driving. Raise it if steering " +
+              "reacts late and weaves; lower it if steering turns in early. Applies from the next drive.")),
+          ):
+            row = self._number_row(key, label, mazda_allowed)
+            rows.append(replace(row, reason=reason) if row.available else row)
       pedal_capability = self._pedal_setup_capability()
       if pedal_capability is not None:
         from opendbc.car.gm.values import GMFlags
@@ -1488,7 +1504,8 @@ class FeatureSettingsOwner:
     elif key.startswith(LONG_PREFIX):
       source_key = PERSONALITY_PROFILES_PARAM
       group = "long"
-    elif key in ("TorqueInterceptorEnabled", "RadarInterceptorEnabled", "NoMRCC", "NoFSC", "BlendedACC", "ManualTransmission"):
+    elif key in ("TorqueInterceptorEnabled", "RadarInterceptorEnabled", "NoMRCC", "NoFSC", "BlendedACC", "ManualTransmission",
+                 *MAZDA_TI1_KEYS):
       source_key, group = key, "parked_preferences"
     elif key in BOOL_DEFAULTS or key in FLOAT_SPECS or key in (*SOURCE_PRIORITY_KEYS, *ADVANCE_KEYS, 'SLCConfirmation', PEDAL_OVERRIDE_KEY):
       source_key = key

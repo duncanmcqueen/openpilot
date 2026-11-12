@@ -29,9 +29,10 @@ def lade_effective_p(v):
   return (kp + lsf) * np.interp(v, ti1_lateral.ERROR_SCALE_BP, ti1_lateral.ERROR_SCALE_V)
 
 
-@pytest.mark.parametrize("v", [1.0, 3.0, 5.0, 6.0, 7.5, 10.0, 12.0, 13.5, 15.0])
+@pytest.mark.parametrize("v", [1.0, 3.0, 5.0, 6.0, 7.5, 10.0])
 def test_error_factor_reproduces_the_tuned_p_gain(v):
   # This controller's KP_INTERP equals the tuned one up to 15 m/s, so kp * factor is the tuned P gain there.
+  # Up to 10 m/s that is Lade's gain unchanged; above, HIGHWAY_SOFTEN takes it down.
   our_kp = np.interp(v, latcontrol_torque.INTERP_SPEEDS, latcontrol_torque.KP_INTERP)
   assert our_kp * ti1_lateral.error_factor(v) == pytest.approx(lade_effective_p(v))
 
@@ -42,9 +43,29 @@ def test_low_speed_gain_is_softened_and_highway_is_near_unity():
   assert 1.0 <= ti1_lateral.error_factor(30.0) < 1.1
 
 
+@pytest.mark.parametrize("v, soften", [(12.0, 1.0 - 0.2 * 2 / 3.5), (13.5, 0.8), (15.0, 0.68)])
+def test_highway_gain_is_softened(v, soften):
+  our_kp = np.interp(v, latcontrol_torque.INTERP_SPEEDS, latcontrol_torque.KP_INTERP)
+  assert our_kp * ti1_lateral.error_factor(v) == pytest.approx(lade_effective_p(v) * soften)
+
+
+def test_highway_effective_p_is_near_nnff():
+  # Route 00000010 weaved at 14-17 m/s with P about 2.2; NNFF, which the tester found smoother, runs a flat 1.0.
+  def p(v):
+    return np.interp(v, latcontrol_torque.INTERP_SPEEDS, latcontrol_torque.KP_INTERP) * ti1_lateral.error_factor(v)
+  assert 1.2 < p(16.0) < 1.45
+  assert 0.95 < p(20.0) < 1.25
+  assert p(10.0) == pytest.approx(lade_effective_p(10.0))
+  speeds = np.arange(10.0, 30.0, 0.25)
+  gains = [p(v) for v in speeds]
+  assert all(np.diff(gains) <= 0.01)                     # no gain bump in or after the softened band
+  assert max(gains[speeds.tolist().index(18.0):]) < 1.25
+
+
 def test_plant_shape():
   assert ti1_lateral.shaped_params(2.0, 0.2, 5.0) == pytest.approx((2.6, 0.32))
-  assert ti1_lateral.shaped_params(2.0, 0.2, 15.0) == pytest.approx((1.8, 0.2 * np.interp(15.0, [5, 13.5, 21], [1.6, 1.5, 1.0])))
+  assert ti1_lateral.shaped_params(2.0, 0.2, 11.0) == pytest.approx((2.0 * np.interp(11.0, [8.75, 11.75], [1.3, 1.1]), 0.3))
+  assert ti1_lateral.shaped_params(2.0, 0.2, 15.0) == pytest.approx((1.8, 0.2))   # friction unscaled from 13.5 m/s
   assert ti1_lateral.shaped_params(2.0, 0.2, 25.0) == pytest.approx((2.0, 0.2))
 
 
@@ -168,3 +189,77 @@ def test_public_update_shapes_every_frame():
   for v, factor in ((5.0, 1.76 * 1.3), (25.0, 1.76)):
     lac.update(True, structs.CarState(vEgo=v, steeringAngleDeg=0.0, steeringPressed=False), vm, params, False, 0.0, False, 0.2)
     assert float(lac.torque_params.latAccelFactor) == pytest.approx(factor, rel=1e-6)
+
+
+class _FakeParams:
+  def __init__(self, values=None, error=None):
+    self.values, self.error = values or {}, error
+
+  def get(self, key):
+    if self.error is not None:
+      raise self.error
+    return self.values.get(key)
+
+
+@pytest.mark.parametrize("raw, expected", [
+  (None, 1.0), (100.0, 1.0), (70.0, 0.7), (b"120.0", 1.2), (150.0, 1.5), (50.0, 0.5),
+  (49.0, 1.0), (151.0, 1.0), (float("nan"), 1.0), (b"junk", 1.0),
+])
+def test_response_scale(raw, expected):
+  assert ti1_lateral.response_scale(_FakeParams({ti1_lateral.RESPONSE_KEY: raw})) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw, expected", [
+  (None, None), (0.0, None), (0.04, None), (0.05, 0.05), (0.3, 0.3), (b"0.45", 0.45), (0.8, 0.8), (0.81, None), (-0.1, None),
+])
+def test_actuator_delay(raw, expected):
+  value = ti1_lateral.actuator_delay(_FakeParams({ti1_lateral.DELAY_KEY: raw}))
+  assert value == (None if expected is None else pytest.approx(expected))
+
+
+def test_settings_survive_a_params_build_without_the_keys():
+  # A device whose libparams predates these keys raises UnknownKeyName; the tune must still load.
+  broken = _FakeParams(error=Exception("UnknownKeyName"))
+  assert ti1_lateral.response_scale(broken) == 1.0
+  assert ti1_lateral.actuator_delay(broken) is None
+
+
+def _lag_message(value):
+  from openpilot.cereal import log
+  msg = log.Event.new_message()
+  msg.init('lateralDelay')
+  msg.lateralDelay.lateralDelay = value
+  msg.lateralDelay.validBlocks = 7
+  return msg
+
+
+def test_delay_publication_overrides_only_the_published_delay():
+  pub = ti1_lateral.DelayPublication(make_cp(), _FakeParams({ti1_lateral.DELAY_KEY: 0.3}))
+  original = _lag_message(0.535)
+  out = pub.delay(original)
+  assert out.lateralDelay.lateralDelay == pytest.approx(0.5)   # 0.3 s actuator delay + lagd's 0.2 s
+  assert out.lateralDelay.validBlocks == 7
+  assert original.lateralDelay.lateralDelay == pytest.approx(0.535)   # the estimator's own message is untouched
+
+
+@pytest.mark.parametrize("cp, values", [
+  (make_cp(), {}),                                                          # unset: learned delay
+  (make_cp(), {ti1_lateral.DELAY_KEY: 0.0}),                                # 0 means learned
+  (make_cp(flags=int(MazdaSafetyFlags.GEN1)), {ti1_lateral.DELAY_KEY: 0.3}),  # stock GEN1 ignores it
+  (make_cp(flags=int(MazdaSafetyFlags.GEN2)), {ti1_lateral.DELAY_KEY: 0.3}),  # TI2 ignores it
+])
+def test_delay_publication_is_inert(cp, values):
+  original = _lag_message(0.535)
+  assert ti1_lateral.DelayPublication(cp, _FakeParams(values)).delay(original) is original
+
+
+@needs_params
+def test_steering_response_scales_the_ti1_error(monkeypatch):
+  monkeypatch.setattr(ti1_lateral, "response_scale", lambda params=None: 0.7)
+  vm = SimpleNamespace(calc_curvature=lambda angle, v, roll: 0.0)
+  params = SimpleNamespace(angleOffsetDeg=0.0, roll=0.0)
+  cs = structs.CarState(vEgo=5.0, steeringAngleDeg=0.0, steeringPressed=False)
+  lac = _controller(make_cp())
+  for _ in range(150):
+    _, _, log = lac.update_standard(True, cs, vm, params, False, 0.5 / 5.0**2, False, 0.2)
+  assert log.error == pytest.approx(0.5 * 0.28804348 * 0.7, rel=1e-3)

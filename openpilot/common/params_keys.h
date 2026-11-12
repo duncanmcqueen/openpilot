@@ -18,6 +18,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"NoMRCC", {PERSISTENT, BOOL}},
     {"RadarInterceptorEnabled", {PERSISTENT, BOOL}},
     {"TorqueInterceptorEnabled", {PERSISTENT, BOOL, "0"}},
+    {"MazdaTI1SteerResponse", {PERSISTENT, FLOAT, "100.0"}},
+    {"MazdaTI1ActuatorDelay", {PERSISTENT, FLOAT, "0.0"}},
     {"WarningImmediateVolume", {PERSISTENT, INT}},
     {"WarningSoftVolume", {PERSISTENT, INT}},
     {"RefuseVolume", {PERSISTENT, INT}},
