@@ -1,6 +1,6 @@
 from opendbc.car import structs
-from opendbc.car.mazda.stock_aol import (GEN2_AOL_SAFETY_PARAM, admitted, gen2_qualified, qualified,
-                                        temporary_restriction)
+from opendbc.car.mazda.stock_aol import (GEN2_AOL_SAFETY_PARAM, TI1_AOL_SAFETY_PARAM, admitted, gen2_qualified,
+                                        qualified, temporary_restriction, ti1_qualified)
 from openpilot.starpilot.aol.policy import AolVehiclePolicy
 from openpilot.starpilot.car.mazda.stock_intent import MazdaStockCardIntent
 
@@ -15,6 +15,8 @@ def _profile_for(cp, model, param):
     return False
   if param == 0:
     return qualified(cp, marked_only=True)
+  if param == TI1_AOL_SAFETY_PARAM:
+    return ti1_qualified(cp, marked_only=True)
   return param == GEN2_AOL_SAFETY_PARAM and gen2_qualified(cp, marked_only=True)
 
 
@@ -28,8 +30,8 @@ def policy_for(cp):
 def native_profile_supported(model, param):
   # Driver monitoring uses this car-independent query when deciding whether
   # native lateral actuation counts as engagement. Keep it in exact agreement
-  # with the two native Panda profiles; _profile_for() still qualifies each CP.
-  return model == int(structs.CarParams.SafetyModel.mazda) and param in (0, GEN2_AOL_SAFETY_PARAM)
+  # with the native Panda profiles; _profile_for() still qualifies each CP.
+  return model == int(structs.CarParams.SafetyModel.mazda) and param in (0, GEN2_AOL_SAFETY_PARAM, TI1_AOL_SAFETY_PARAM)
 
 
 def native_accepts_cp(cp, model, param):

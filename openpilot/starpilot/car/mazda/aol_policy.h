@@ -2,11 +2,11 @@
 
 #include "selfdrive/pandad/aol_protocol.h"
 
-// Native profile for GEN2 Mazda (safety model 13, safetyParam 2 = FLAG_GEN2).
-// Parameter 0 remains the stock GEN1 profile; parameter 2 is the GEN2 profile
-// implemented in opendbc/safety/modes/mazda.h, which grants lateral only.
+// Native profiles for Mazda (safety model 13), implemented in opendbc/safety/modes/mazda.h:
+// 0 = stock GEN1, 2 = GEN2 (FLAG_GEN2), 9 = GEN1 Torque Interceptor (FLAG_GEN1 | FLAG_TORQUE_INTERCEPTOR).
+// Each grants lateral only.
 inline bool mazda_aol_param(uint16_t param) {
-  return (param == 0U) || (param == 2U);
+  return (param == 0U) || (param == 2U) || (param == 9U);
 }
 
 inline constexpr AolSafetyProfile MAZDA_AOL_PROFILE{13U, mazda_aol_param, true};

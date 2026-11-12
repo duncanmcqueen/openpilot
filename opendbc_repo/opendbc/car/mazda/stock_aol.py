@@ -87,6 +87,38 @@ def gen2_configuration(cp, *, marked_only=False):
           cp.alternativeExperience in ((32,) if marked_only else (0, 32)))
 
 
+# GEN1 Torque Interceptor (TI1) AOL. The GEN1 sources (0x21C MAIN, 0x228 GEAR, the 0x243 camera
+# LKAS bit) with TI_FEEDBACK liveness in place of the EPS 0x241 lockout bit, which the TI steers
+# through. Camera required: exactly GEN1 | TORQUE_INTERCEPTOR, no RI/NoMRCC/NoFSC variants.
+TI1_CARS = frozenset((CAR.MAZDA_CX8,))
+TI1_AOL_SAFETY_PARAM = int(MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR)
+
+# Evidence gates for the TI1 profile. Each stays False until closed with recorded evidence.
+TI1_EVIDENCE_GATES = {
+  # OPEN: a CX-8 TI1 capture must show 0x21C bit 17 following the cruise main switch, 0x228
+  # decoding P/R/N/D, and the 0x243 camera LKAS bit, on the buses the GEN1 profile reads.
+  'cx8_signals': False,
+}
+
+
+def ti1_configuration(cp, *, marked_only=False):
+  """TI1 AOL configuration: stock longitudinal, automatic, the exact TI1 safety parameter."""
+  return (cp.brand == "mazda" and cp.carFingerprint in TI1_CARS and
+          int(cp.flags) == TI1_AOL_SAFETY_PARAM and
+          not cp.passive and not cp.notCar and not cp.dashcamOnly and
+          cp.transmissionType == structs.CarParams.TransmissionType.automatic and
+          cp.fingerprintSource != structs.CarParams.FingerprintSource.fixed and
+          cp.pcmCruise and not cp.openpilotLongitudinalControl and
+          _only_safety_config_is(cp, TI1_AOL_SAFETY_PARAM) and
+          cp.alternativeExperience in ((32,) if marked_only else (0, 32)))
+
+
+def ti1_qualified(cp, gates=TI1_EVIDENCE_GATES, *, marked_only=False):
+  """TI1 AOL admission. Blocked while any evidence gate is open; the table must be exactly the known set."""
+  return bool(gates.keys() == TI1_EVIDENCE_GATES.keys() and all(gates.values()) and
+              ti1_configuration(cp, marked_only=marked_only))
+
+
 def _only_safety_config_is(cp, param):
   """Exactly one safety config, and it is Mazda with this param.
 
@@ -126,7 +158,8 @@ def qualified(cp, *, marked_only=False):
 
 def admitted(cp, *, marked_only=False):
   """AOL admission for either profile. GEN1 stock behaviour is unchanged."""
-  return qualified(cp, marked_only=marked_only) or gen2_qualified(cp, marked_only=marked_only)
+  return (qualified(cp, marked_only=marked_only) or gen2_qualified(cp, marked_only=marked_only) or
+          ti1_qualified(cp, marked_only=marked_only))
 
 
 # Panda withholds lateral while a temporary restriction holds (standstill: its

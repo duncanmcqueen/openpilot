@@ -2,6 +2,7 @@
 
 static bool mazda_ti_unhealthy(void);
 static bool mazda_ti_lateral_paused(void);
+static bool mazda_ti1_aol_blocked(void);
 
 static bool mazda_aol_enabled = false;
 static bool mazda_aol_startup_pending = true;
@@ -105,7 +106,8 @@ static uint8_t mazda_aol_permission(void) {
     // Only lateral has a standstill restriction. Ordinary openpilot
     // longitudinal must retain HOLD/RESUME authority while stopped.
     // A TI2 0x02 pause withholds lateral without revoking the token, like standstill.
-    if (vehicle_moving && !mazda_ti_lateral_paused() && (controls_allowed || mazda_aol_token)) {
+    // A TI1 violation or non-running state withholds lateral the same way, keeping the token.
+    if (vehicle_moving && !mazda_ti_lateral_paused() && !mazda_ti1_aol_blocked() && (controls_allowed || mazda_aol_token)) {
       permission = request & 1U;
     }
     if (controls_allowed) {
@@ -140,7 +142,9 @@ static void mazda_aol_optional_rx(const CANPacket_t *msg) {
       } else {
         mazda_aol_sources = (mazda_aol_sources & 6U) | (((msg->data[0] & 7U) == 4U) ? 1U : 0U);
       }
-    } else if (msg_matches(msg, 0x241U, 0U, 8U)) {
+    } else if (msg_matches(msg, 0x241U, 0U, 8U) && !mazda_torque_interceptor) {
+      // TI1 cars use TI_FEEDBACK liveness instead (mazda_aol_rx): the TI steers through the EPS
+      // lockout, so the 0x241 bit is not a restriction there.
       mazda_aol_seen |= 4U;
       mazda_aol_eps_ts = now;
       mazda_aol_sources = (mazda_aol_sources & 5U) | (GET_BIT(msg, 50U) ? 2U : 0U);
@@ -185,6 +189,11 @@ static void mazda_aol_rx(const CANPacket_t *msg) {
         mazda_aol_neutral = false;
       } else {
       }
+    } else if (mazda_gen1 && mazda_torque_interceptor && msg_matches(msg, 0x24AU, 1U, 8U)) {
+      // TI1 interceptor liveness plays the role of the GEN1 EPS source, with no lockout bit.
+      mazda_aol_seen |= 4U;
+      mazda_aol_eps_ts = microsecond_timer_get();
+      mazda_aol_sources &= 5U;
     } else if (msg_matches(msg, 0x24BU, 1U, 8U)) {
       // GEN2 interceptor liveness plays the role of the GEN1 EPS source. There is
       // no EPS-override bit on this platform, so the source bit stays clear.

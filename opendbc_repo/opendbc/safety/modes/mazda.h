@@ -175,6 +175,17 @@ static bool mazda_ti1_healthy(void) {
     (safety_get_ts_elapsed(microsecond_timer_get(), mazda_ti1_feedback_ts) <= MAZDA_TI_FEEDBACK_TIMEOUT_US);
 }
 
+// TI1 AOL: lateral permission is withheld (the AOL token is kept, like standstill) while the
+// TI1 reports a violation or a state other than RUN or DRIVER_OVER. DRIVER_OVER and ramp-down
+// keep permission: the TI ignores torque then and the tx check already refuses nonzero 0x249.
+// Silence is covered by the AOL source freshness (TI_FEEDBACK is the TI1 EPS source).
+#define MAZDA_TI1_STATE_DRIVER_OVER 2U
+static bool mazda_ti1_aol_blocked(void) {
+  return mazda_gen1 && mazda_torque_interceptor &&
+    ((mazda_ti1_viol != 0U) ||
+     ((mazda_ti1_state != MAZDA_TI_STATE_RUN) && (mazda_ti1_state != MAZDA_TI1_STATE_DRIVER_OVER)));
+}
+
 // ACC integrity: 0x220 carries a checksum in byte 7 (seed 0x2a over bytes 0..6).
 static bool mazda_acc_checksum_valid(const uint8_t *data) {
   uint8_t sum = 0x2AU;
@@ -615,7 +626,8 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
 static safety_config mazda_init(uint16_t param) {
   // MAZDA_TX_MSGS stays non-const: the Dom stock-AOL path rewrites check_relay.
   static CanMsg MAZDA_TX_MSGS[] = {{MAZDA_LKAS, 0, 8, .check_relay = true}, {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false}, {MAZDA_LKAS_HUD, 0, 8, .check_relay = true}};
-  static const CanMsg MAZDA_TI_TX_MSGS[] = {{MAZDA_LKAS, 0, 8, .check_relay = true}, {MAZDA_TI_LKAS, 1, 8, .check_relay = false}, {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false}, {MAZDA_LKAS_HUD, 0, 8, .check_relay = true}};
+  // Non-const for the same reason: the TI1 AOL profile rewrites the 0x243/0x440 check_relay.
+  static CanMsg MAZDA_TI_TX_MSGS[] = {{MAZDA_LKAS, 0, 8, .check_relay = true}, {MAZDA_TI_LKAS, 1, 8, .check_relay = false}, {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false}, {MAZDA_LKAS_HUD, 0, 8, .check_relay = true}};
   static const CanMsg MAZDA_RI_TX_MSGS[] = {{MAZDA_LKAS, 0, 8, .check_relay = true}, {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false}, {MAZDA_LKAS_HUD, 0, 8, .check_relay = true},
                                     {MAZDA_CRZ_CTRL, 0, 8, .check_relay = true}, {MAZDA_CRZ_INFO, 0, 8, .check_relay = true}, {MAZDA_RADAR_361, 0, 8, .check_relay = true}, {MAZDA_RADAR_362, 0, 8, .check_relay = true},
                                     {MAZDA_RADAR_363, 0, 8, .check_relay = true}, {MAZDA_RADAR_364, 0, 8, .check_relay = true}, {MAZDA_RADAR_365, 0, 8, .check_relay = true}, {MAZDA_RADAR_366, 0, 8, .check_relay = true},
@@ -702,9 +714,15 @@ static safety_config mazda_init(uint16_t param) {
   // GEN1 stock AOL keeps its original scope. GEN2 joins it through the same
   // protocol with its own sources (mazda_stock_aol.h): CRZ_STATE main, GEAR,
   // interceptor liveness and camera-bus speed.
-  mazda_aol_enabled = (stock_gen1 || (param == (uint16_t)FLAG_GEN2)) && ((unsigned int)alternative_experience == 32U);
+  // TI1 joins with exactly GEN1 | TORQUE_INTERCEPTOR (camera present, no RI/NoMRCC/NoFSC): the GEN1
+  // sources, with TI_FEEDBACK liveness in place of the EPS 0x241 lockout bit.
+  const bool ti1_aol = (param == (uint16_t)(FLAG_GEN1 | FLAG_TORQUE_INTERCEPTOR));
+  mazda_aol_enabled = (stock_gen1 || (param == (uint16_t)FLAG_GEN2) || ti1_aol) &&
+                      ((unsigned int)alternative_experience == 32U);
   MAZDA_TX_MSGS[0].check_relay = !mazda_aol_enabled;
   MAZDA_TX_MSGS[2].check_relay = !mazda_aol_enabled;
+  MAZDA_TI_TX_MSGS[0].check_relay = !mazda_aol_enabled;
+  MAZDA_TI_TX_MSGS[3].check_relay = !mazda_aol_enabled;
   if (mazda_aol_enabled) {
     static const AolSafetyPolicy policy = {
       .reset = mazda_aol_reset,
