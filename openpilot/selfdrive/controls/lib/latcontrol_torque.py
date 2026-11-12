@@ -15,6 +15,7 @@ from openpilot.starpilot.lateral.controller_selection import ControllerMode, def
 from openpilot.starpilot.lateral.torque_shaping import KP as STARPILOT_KP
 from openpilot.starpilot.lateral.torque_extension import apply_turn_assist, create_extension, create_turn_assist
 from openpilot.starpilot.flm import live as flm
+from openpilot.starpilot.car.mazda import ti1_lateral as mazda_ti1_lateral
 
 # At higher speeds (25+mph) we can assume:
 # Lateral acceleration achieved by a specific car correlates to
@@ -81,9 +82,33 @@ class LatControlTorque(LatControl):
     self.native_learning_last_tick = 0
     self.native_learning_source = None
 
+    # GEN1 Mazda Torque Interceptor (TI1): limit at the TI ceiling, speed-shaped plant and low-speed error
+    # (openpilot/starpilot/car/mazda/ti1_lateral.py). Other cars, including TI2, are untouched.
+    self.mazda_ti1 = mazda_ti1_lateral.is_ti1(CP)
+    self.mazda_ti1_base = None
+    self.mazda_ti1_v_ego = 0.0
+    if self.mazda_ti1:
+      self.steer_max = mazda_ti1_lateral.steer_max(CP)
+      self.mazda_ti1_base = (float(self.torque_params.latAccelFactor), float(self.torque_params.friction))
+      self.update_limits()
+
+  def _apply_mazda_ti1_shape(self, v_ego):
+    self.mazda_ti1_v_ego = v_ego
+    lat_accel_factor, friction = mazda_ti1_lateral.shaped_params(*self.mazda_ti1_base, v_ego)
+    # torque_params is a capnp Float32 builder: compare in float32, or the limits are recomputed every frame
+    if (np.float32(lat_accel_factor) != np.float32(self.torque_params.latAccelFactor) or
+        np.float32(friction) != np.float32(self.torque_params.friction)):
+      self.torque_params.latAccelFactor = lat_accel_factor
+      self.torque_params.friction = friction
+      self.update_limits()
+
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     if self.starpilot_extension is not None:
       latAccelFactor, latAccelOffset, friction = self.starpilot_extension.transform_torque_parameters(latAccelFactor, latAccelOffset, friction)
+    if self.mazda_ti1:
+      # New values are the highway base; the speed shape stays applied on top.
+      self.mazda_ti1_base = (float(latAccelFactor), float(friction))
+      latAccelFactor, friction = mazda_ti1_lateral.shaped_params(latAccelFactor, friction, self.mazda_ti1_v_ego)
     self.torque_params.latAccelFactor = latAccelFactor
     self.torque_params.latAccelOffset = latAccelOffset
     self.torque_params.friction = friction
@@ -101,6 +126,8 @@ class LatControlTorque(LatControl):
     return get_friction(error, deadzone, threshold, self.torque_params)
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
+    if self.mazda_ti1:
+      self._apply_mazda_ti1_shape(CS.vEgo)
     self.flm_surface = self.flm_source.sample(active=active, speed=CS.vEgo)
     if self.manual_flm_effects is not None:
       self.manual_flm_effects.begin_frame()
@@ -140,6 +167,9 @@ class LatControlTorque(LatControl):
     expected_lateral_accel = self.lat_accel_request_buffer[-delay_frames]
     setpoint = expected_lateral_accel
     error = setpoint - measurement
+    if self.mazda_ti1:
+      # P and the friction input, as in the TI1 tune this was ported from (ti1_lateral.error_factor).
+      error *= mazda_ti1_lateral.error_factor(CS.vEgo)
 
     lookahead_idx = int(np.clip(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len + 1, -2))
     raw_lateral_jerk = (self.lat_accel_request_buffer[lookahead_idx + 1] - self.lat_accel_request_buffer[lookahead_idx - 1]) / (2 * self.dt)
