@@ -392,8 +392,16 @@ class CarState(CarStateBase):
     if not (CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3)):
       cam_signals.append(("CAM_TRAFFIC_SIGNS", 0))
 
-    body = CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1)
-    if CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3 | MazdaSafetyFlags.TORQUE_INTERCEPTOR):
+    if CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR and not CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3):
+      # TI1: the interceptor stays silent until it receives 0x249, which the comma only sends once panda is in
+      # Mazda safety, and the handover to Mazda safety waits for CAN to be valid. So TI_FEEDBACK must not count
+      # towards CAN validity (NaN: liveness not checked), or a TI1 car deadlocks at start-up with "CAN Bus
+      # Disconnected". Silence is still handled by the TI health check (ti_feedback_fresh -> no steering and a
+      # TI alert), and panda refuses nonzero 0x249 without fresh feedback.
+      body = CANParser(DBC[CP.carFingerprint][Bus.pt], [("TI_FEEDBACK", float('nan'))], 1)
+    else:
+      body = CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1)
+    if CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3):
       # Register TI_FEEDBACK (0x24B TI2, 0x24A TI1) now, exactly as a first vl[] access would (no
       # frequency), so the health models see every frame from the first one, as panda does.
       _ = body.vl["TI_FEEDBACK"]

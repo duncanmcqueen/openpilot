@@ -280,3 +280,38 @@ def test_ti1_ignores_the_camera_lane_keep_state():
   car_state, ret = carstate_with(TI_STATE.RUN, 0)
   assert not ret.invalidLkasSetting
   assert not car_state.lkas_disabled
+
+
+def test_ti1_silence_does_not_invalidate_can():
+  # Field report: the TI1 stays quiet until it receives 0x249, which needs panda in Mazda safety, which waits
+  # for CAN to be valid. TI_FEEDBACK must not count towards CAN validity, while the TI health check still
+  # blocks steering and alerts.
+  feed = Feed()
+  body = feed.parsers[Bus.body]
+  for _ in range(100):  # one second with bus 1 completely silent
+    ret = feed.update(feedback=False)
+    assert body.can_valid and not body.bus_timeout
+    assert not feed.cs.ti_lkas_allowed and ret.steerFaultTemporary
+  # the TI1 wakes once the comma starts sending 0x249
+  ret = feed.update()
+  assert body.can_valid and feed.cs.ti_lkas_allowed and not ret.steerFaultTemporary
+  # and going quiet mid-drive stops steering through the health check, not a CAN error
+  ret = feed.update(dt_ms=500, feedback=False)
+  assert body.can_valid and not body.bus_timeout
+  assert not feed.cs.ti_lkas_allowed and ret.steerFaultTemporary
+
+
+@pytest.mark.parametrize("flags, fingerprint", [
+  (int(MazdaSafetyFlags.GEN2), CAR.MAZDA_3_2019),
+  (int(MazdaSafetyFlags.GEN1), CAR.MAZDA_CX9_2021),
+])
+def test_only_ti1_feedback_skips_the_liveness_check(flags, fingerprint):
+  # TI2 (GEN2) keeps TI_FEEDBACK in CAN validity, and stock GEN1 does not read it at all.
+  body = CarState.get_can_parsers(cp(flags, fingerprint))[Bus.body]
+  states = list(body.message_states.values())
+  if flags & MazdaSafetyFlags.GEN2:
+    assert len(states) == 1 and not states[0].ignore_alive
+  else:
+    assert states == []
+  ti1 = CarState.get_can_parsers(cp())[Bus.body]
+  assert [s.ignore_alive for s in ti1.message_states.values()] == [True]
